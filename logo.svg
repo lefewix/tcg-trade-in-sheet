@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="TCG Sales CSV">
+  <title>TCG Sales CSV</title>
+  <!-- Three cards stood on a shelf, rising left to right: a card fan that is also a
+       price chart. Tallest card carries the accent because it is the figure you export. -->
+  <rect x="14" y="72" width="30" height="42" rx="6" fill="#c3cad6"/>
+  <rect x="49" y="52" width="30" height="62" rx="6" fill="#8b95a6"/>
+  <rect x="84" y="24" width="30" height="90" rx="6" fill="#2647c9"/>
+  <rect x="10" y="118" width="108" height="8" rx="4" fill="#151a21"/>
+</svg>
