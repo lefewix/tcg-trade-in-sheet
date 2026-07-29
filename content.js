@@ -128,7 +128,7 @@ function mount(node) {
 // content script can mount into markup the framework then throws away, so the panel
 // silently vanishes. Rather than guess at timing, watch the DOM and re-mount.
 // Also catches client-side navigation between products, which never reloads the page.
-let panel, floatRoot, href = location.href;
+let panel, floatRoot, href = "";
 function keepMounted() {
   let pending = 0;
   const check = () => {
@@ -152,10 +152,19 @@ function rebuild() {
   if (PID) init();
 }
 
+// Set by floatingUi; the worker streams refresh progress and this is where it lands.
+let refreshProgress = () => {};
+
 function start() {
+  href = location.href;
   style();
   floatingUi();
   keepMounted();
+  if (chrome.runtime && chrome.runtime.onMessage) {
+    chrome.runtime.onMessage.addListener(msg => {
+      if (msg && msg.type === "refreshProgress") refreshProgress(msg.done, msg.total);
+    });
+  }
   init();
 }
 
@@ -301,6 +310,13 @@ function style() {
     .tsc-sum-r{text-align:right}
     .tsc-sum-r .tsc-sum-v{color:var(--tsc-ac-ink)}
 
+    /* first-run rate banner: sits between the total and the controls, because it is
+       the reason the total says what it says */
+    .tsc-rate{padding:10px 14px;border-bottom:1px solid var(--tsc-hair);
+      background:var(--tsc-warn-tint);color:var(--tsc-warn);font-size:11.5px;line-height:1.45}
+    .tsc-rate[hidden]{display:none}
+    .tsc-rate b{font-weight:700}
+
     /* tools strip: the two settings-ish actions, kept out of the primary footer */
     .tsc-tools{display:flex;align-items:center;gap:7px;padding:9px 12px 9px 14px;
       border-bottom:1px solid var(--tsc-hair)}
@@ -355,6 +371,8 @@ function style() {
     .tsc-flag{flex:none;display:inline-flex;align-items:center;gap:3px;padding:1px 5px 1px 4px;
       border-radius:6px;background:var(--tsc-warn-tint);border:1px solid var(--tsc-warn-line);
       color:var(--tsc-warn);font:10.5px/1.5 var(--tsc-mono);font-weight:600}
+    .tsc-flag-bad{background:var(--tsc-err-tint);border-color:var(--tsc-err-line);
+      color:var(--tsc-err)}
     .tsc-p{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
     .tsc-usd{font:13px/1.25 var(--tsc-mono);font-weight:600;color:var(--tsc-ink)}
     .tsc-cad{font:11px/1.25 var(--tsc-mono);color:var(--tsc-mut)}
@@ -432,22 +450,46 @@ const label = sel => `${sel.condition}, ${sel.variant}`;
 
 // ---------------------------------------------------------------- drawer
 
-let badge, drawer, listBox, sumBox, toolsBox, globalInput, pill, exportBtns = [];
+let badge, drawer, listBox, sumBox, toolsBox, rateBox, printBtn, globalInput, pill;
+let exportBtns = [];
 let globalPct = 100;
+let pctSet = false;      // has the house rate ever been chosen on this machine?
 let pendingHit = null;   // key of the row to flash on the next render
+let failedKeys = new Set();  // rows the last refresh could not re-pull
+
+const LOW_SAMPLES = 3;   // must match the worker's constant
+const STALE_DAYS = 60;
 
 const reduced = () =>
   window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 // A row's percent is its own override when it has one, otherwise the house rate.
 // undefined and "no override" are the same thing; 0 is a real (if odd) answer.
-const rowPct = row => (row._pct === undefined || row._pct === null ? globalPct : row._pct);
+const pctFor = (row, pct) => (row._pct === undefined || row._pct === null ? pct : row._pct);
+const rowPct = row => pctFor(row, globalPct);
 
-// What you would actually pay for one copy. null when the FX fetch missed.
-function tradeCad(row) {
+// You cannot pay a fraction of a cent. The unit is rounded HERE, once, and every total -
+// the drawer summary, the print sheet's line totals, the grand total - is built by
+// multiplying the rounded figure. Rounding for display and multiplying the raw number is
+// how a printed sheet ends up with lines that do not sum to its own footer.
+const round2 = n => Math.round((n + Number.EPSILON) * 100) / 100;
+
+// What you would actually pay for one copy, to the cent. null when the FX fetch missed.
+function tradeUnit(row, pct) {
   if (!row.cad) return null;
-  return parseFloat(row.cad) * rowPct(row) / 100;
+  return round2(parseFloat(row.cad) * pctFor(row, pct) / 100);
 }
+
+// The whole line: the ROUNDED unit times the copies, so unit x qty always checks out.
+function tradeLine(row, pct) {
+  const unit = tradeUnit(row, pct);
+  return unit === null ? null : round2(unit * Math.max(1, Number(row.qty) || 1));
+}
+
+const tradeCad = row => tradeUnit(row, globalPct);
+const tradeTotal = row => tradeLine(row, globalPct);
+
+const lowSamples = row => Number(row._samples) > 0 && Number(row._samples) < LOW_SAMPLES;
 
 function setCount(n) {
   if (!badge) return;
@@ -463,7 +505,7 @@ function renderSummary(rows) {
   const copies = rows.reduce((n, r) => n + (Number(r.qty) || 1), 0);
   const usd = rows.reduce((n, r) => n + parseFloat(r.avg_usd) * (Number(r.qty) || 1), 0);
   const priced = rows.filter(r => r.cad !== "");
-  const cad = priced.reduce((n, r) => n + tradeCad(r) * (Number(r.qty) || 1), 0);
+  const cad = round2(priced.reduce((n, r) => n + tradeTotal(r), 0));
 
   // Two totals, and they can cover different rows: the CAD side skips anything the FX
   // fetch missed. Say so rather than let the numbers look like they disagree.
@@ -483,15 +525,38 @@ function renderSummary(rows) {
   sumBox.append(left, right);
 }
 
+// DEFAULT_PCT is 100. On a fresh install, a second machine, or after cleared storage,
+// every row is therefore priced at full market and nothing said so - Print sheet would
+// hand a customer a document offering them 100% of retail. Until somebody has chosen the
+// house rate ONCE, this banner sits above the list and Print is refused.
+function renderRateBanner(rowCount) {
+  if (!rateBox) return;
+  rateBox.textContent = "";
+  const show = !pctSet && rowCount > 0;
+  rateBox.hidden = !show;
+  if (printBtn) {
+    printBtn.disabled = !pctSet;
+    printBtn.title = pctSet
+      ? "Open a clean, customer-facing sheet ready to print."
+      : "Set your trade-in rate before printing a customer-facing sheet.";
+  }
+  if (!show) return;
+  const b = el("b", null, "Set your trade-in rate.");
+  rateBox.append(b, document.createTextNode(
+    ` Every row is priced at ${globalPct}% of market until you do, and printing is off.`));
+}
+
 async function renderList() {
   const res = await send({ type: "list" });
   if (!res.ok) return;
   globalPct = res.pct;
+  pctSet = !!res.pctSet;
   if (globalInput && document.activeElement !== globalInput) {
     globalInput.value = String(globalPct);
   }
   setCount(res.count);
   toolsBox.hidden = !res.rows.length;
+  renderRateBanner(res.rows.length);
   listBox.textContent = "";
   let hitRow = null;
   // nothing to copy or export until something is in the store
@@ -525,7 +590,27 @@ async function renderList() {
     if (row._language && row._language !== "English") {
       sub.appendChild(el("span", "tsc-keep", row._language));
     }
-    sub.appendChild(el("span", "tsc-keep", `${row._samples || "?"} sales`));
+    // Sample count is a warning, not a footnote. One sale is one person's opinion of
+    // what a $400 card is worth, and a title attribute nobody hovers is not a signal.
+    if (lowSamples(row)) {
+      const thin = el("span", "tsc-flag");
+      thin.appendChild(icon("warn", 11));
+      thin.appendChild(document.createTextNode(
+        `${row._samples} sale${row._samples === 1 ? "" : "s"}`));
+      thin.title = `Averaged from only ${row._samples} sale`
+        + `${row._samples === 1 ? "" : "s"}. Treat this price as a guess.`;
+      sub.appendChild(thin);
+    } else {
+      sub.appendChild(el("span", "tsc-keep", `${row._samples || "?"} sales`));
+    }
+    if (failedKeys.has(row.key)) {
+      const bad = el("span", "tsc-flag tsc-flag-bad");
+      bad.appendChild(icon("warn", 11));
+      bad.appendChild(document.createTextNode("not refreshed"));
+      bad.title = "The last Refresh prices run could not re-pull this row. "
+        + "Its price is whatever it was before.";
+      sub.appendChild(bad);
+    }
     if (row._stale) {
       const flag = el("span", "tsc-flag");
       flag.appendChild(icon("warn", 11));
@@ -542,7 +627,10 @@ async function renderList() {
       paid === null ? "no rate" : money(paid) + " CAD");
     if (row._fx_rate) {
       cad.title = `${row.cad} CAD market at ${rowPct(row)}%. `
-        + `Converted at ${row._fx_rate}, fetched ${row._fx_at}`
+        + `Converted at ${row._fx_rate}`
+        + (row._fx_date ? ` (rate dated ${row._fx_date}` +
+            (row._fx_src ? `, ${row._fx_src}` : "") + ")" : "")
+        + `, fetched ${row._fx_at}`
         + (row._fx_stale ? ". The last refresh could not reach the rate service, "
           + "so this is the previous rate." : "");
     }
@@ -607,6 +695,17 @@ async function renderList() {
 // only where nothing newer has taken their place. Undo never deletes.
 let toastEl = null, toastTimer = 0;
 
+// Undo is allowed to be partial: a row that came back on its own inside the five seconds
+// is left exactly as it is, and the snapshot's older copy - with the qty and per-row
+// percent you had typed - is dropped. Throwing that response away meant "clear,
+// re-collect one card, Undo" silently lost that row's edits with no sign at all.
+// Returns null when the undo was total, which is the ordinary case and needs no words.
+function undoOutcome(res) {
+  if (!res || !res.ok || !res.kept) return null;
+  return `Restored ${res.restored} row${res.restored === 1 ? "" : "s"}`
+    + ` · ${res.kept} left as ${res.kept === 1 ? "it was" : "they were"}`;
+}
+
 function undoToast(text, prev, keys) {
   if (toastEl) toastEl.remove();
   clearTimeout(toastTimer);
@@ -619,13 +718,26 @@ function undoToast(text, prev, keys) {
   btn.type = "button";
   btn.addEventListener("click", async () => {
     dismissToast(t);
-    await send({ type: "restore", store: prev, keys });
+    const res = await send({ type: "restore", store: prev, keys });
     renderList();
+    const outcome = undoOutcome(res);
+    if (outcome) infoToast(outcome);
   });
   t.appendChild(btn);
 
   floatRoot.insertBefore(t, floatRoot.firstChild);
   toastTimer = setTimeout(() => dismissToast(t), 5000);
+}
+
+// Same surface, no button: the outcome of an undo that could not do all of it.
+function infoToast(text) {
+  if (toastEl) toastEl.remove();
+  clearTimeout(toastTimer);
+  const t = toastEl = el("div", "tsc-toast");
+  t.setAttribute("role", "status");
+  t.appendChild(el("span", "tsc-toast-t", text));
+  floatRoot.insertBefore(t, floatRoot.firstChild);
+  toastTimer = setTimeout(() => dismissToast(t), 4000);
 }
 
 function dismissToast(t) {
@@ -642,18 +754,18 @@ const esc = s => String(s === null || s === undefined ? "" : s)
 // A customer-facing document, so it is light and boring on purpose: the drawer's dark
 // violet is our tool, not something to hand across a counter. Written into a blank
 // window rather than fetched from a template - no bundler, no extra file, no network.
-function printDoc(rows) {
+function printDoc(rows, housePct) {
   const lines = rows.map(r => {
-    const qty = Number(r.qty) || 1;
-    const unit = tradeCad(r);
+    const qty = Math.max(1, Number(r.qty) || 1);
+    // ONE rounding, and the line total is built from the rounded unit. Line totals that
+    // do not add up to the footer are the fastest way to lose an argument at a counter.
     return {
       name: r.name, set: r.set, printing: r.printing, condition: r.condition,
-      qty,
-      unit: unit === null ? null : unit,
-      total: unit === null ? null : unit * qty
+      qty, pct: pctFor(r, housePct),
+      unit: tradeUnit(r, housePct), total: tradeLine(r, housePct)
     };
   });
-  const grand = lines.reduce((n, l) => n + (l.total || 0), 0);
+  const grand = round2(lines.reduce((n, l) => n + (l.total || 0), 0));
   const copies = lines.reduce((n, l) => n + l.qty, 0);
   const missing = lines.filter(l => l.total === null).length;
   const dash = "&#8212;";
@@ -661,9 +773,59 @@ function printDoc(rows) {
   const body = lines.map(l => `<tr>
       <td>${esc(l.name)}</td><td>${esc(l.set)}</td><td>${esc(l.printing)}</td>
       <td>${esc(l.condition)}</td><td class="n">${l.qty}</td>
+      <td class="n">${l.pct}%</td>
       <td class="n">${l.unit === null ? dash : money(l.unit)}</td>
       <td class="n">${l.total === null ? dash : money(l.total)}</td>
     </tr>`).join("");
+
+  // Everything the sheet was priced off, stated on the sheet. The rows persist across
+  // days, each carrying its own rate, so a collection built over a week sums a total
+  // across several exchange rates - the footer is where that stops being invisible.
+  const notes = [];
+  const overrides = rows.filter(r => r._pct !== undefined && r._pct !== null).length;
+  notes.push(`Priced at ${housePct}% of market value`
+    + (overrides
+      ? `, except ${overrides} line${overrides === 1 ? "" : "s"} at `
+        + `${overrides === 1 ? "its" : "their"} own rate (see the % column)`
+      : "") + ".");
+
+  const fx = new Map();
+  for (const r of rows) {
+    if (!r._fx_rate) continue;
+    const when = r._fx_date || (r._fx_at || "").slice(0, 10);
+    fx.set(`${r._fx_rate}|${when}`, { rate: r._fx_rate, when, src: r._fx_src || "" });
+  }
+  const fxList = Array.from(fx.values());
+  if (fxList.length === 1) {
+    notes.push(`Converted from USD at ${fxList[0].rate}`
+      + (fxList[0].when ? `, rate dated ${fxList[0].when}` : "") + ".");
+  } else if (fxList.length > 1) {
+    notes.push(`Converted from USD at ${fxList.length} different rates: `
+      + fxList.map(f => `${f.rate}${f.when ? ` (${f.when})` : ""}`).join(", ")
+      + ". Refresh prices to put every line on today's rate.");
+  }
+
+  const dates = rows.map(r => r._oldest).filter(Boolean).sort();
+  if (dates.length) {
+    notes.push(dates[0] === dates[dates.length - 1]
+      ? `Sales data back to ${dates[0]}.`
+      : `Oldest sale used per line falls between ${dates[0]} and ${dates[dates.length - 1]}.`);
+  }
+
+  const thin = rows.filter(lowSamples).length;
+  const stale = rows.filter(r => r._stale).length;
+  if (thin || stale) {
+    notes.push([
+      thin ? `${thin} line${thin === 1 ? "" : "s"} averaged fewer than ${LOW_SAMPLES} sales`
+        : null,
+      stale ? `${stale} line${stale === 1 ? "" : "s"} rest${stale === 1 ? "s" : ""} on `
+        + `sales over ${STALE_DAYS} days old` : null
+    ].filter(Boolean).join("; ") + ".");
+  }
+  if (missing) {
+    notes.push(`${missing} line${missing === 1 ? "" : "s"} had no exchange rate and `
+      + `${missing === 1 ? "is" : "are"} excluded from the total.`);
+  }
 
   return `<!doctype html><html><head><meta charset="utf-8">
 <title>Trade-in sheet ${new Date().toISOString().slice(0, 10)}</title>
@@ -686,29 +848,34 @@ function printDoc(rows) {
   th.n{text-align:right}
   tfoot td{border-bottom:0;border-top:2px solid var(--ink);font-weight:700;padding-top:11px}
   tfoot .n{font-size:15px}
-  .note{margin:14px 0 0;font-size:11.5px;color:var(--mut)}
+  .notes{margin:14px 0 0;padding:0;list-style:none;font-size:11.5px;color:var(--mut)}
+  .notes li{margin:0 0 3px}
   @media print{body{padding:0}thead{display:table-header-group}}
 </style></head><body>
 <header><h1>Trade-in sheet</h1>
-  <span class="date">${new Date().toLocaleDateString("en-CA")} &#183; ${rows.length} card${rows.length === 1 ? "" : "s"}, ${copies} cop${copies === 1 ? "y" : "ies"}</span>
+  <span class="date">${new Date().toLocaleDateString("en-CA")} &#183; ${rows.length} card${rows.length === 1 ? "" : "s"}, ${copies} cop${copies === 1 ? "y" : "ies"} &#183; ${housePct}% of market</span>
 </header>
 <table><thead><tr>
   <th>Card</th><th>Set</th><th>Printing</th><th>Condition</th>
-  <th class="n">Qty</th><th class="n">Unit CAD</th><th class="n">Line total</th>
+  <th class="n">Qty</th><th class="n">%</th><th class="n">Unit CAD</th><th class="n">Line total</th>
 </tr></thead><tbody>${body}</tbody>
-<tfoot><tr><td colspan="6">Total offer</td><td class="n">${money(grand)}</td></tr></tfoot></table>
-${missing ? `<p class="note">${missing} row${missing === 1 ? "" : "s"} had no exchange rate and are excluded from the total.</p>` : ""}
+<tfoot><tr><td colspan="7">Total offer</td><td class="n">${money(grand)}</td></tr></tfoot></table>
+<ul class="notes">${notes.map(n => `<li>${esc(n)}</li>`).join("")}</ul>
 </body></html>`;
 }
 
 async function openPrintSheet() {
   const res = await send({ type: "list" });
   if (!res.ok || !res.rows.length) return "nothing to print";
+  // The default house rate is 100%. Printing before anybody has chosen one hands a
+  // customer a signed offer at full retail, so this is a block, not a nudge.
+  if (!res.pctSet) return "set the rate first";
   globalPct = res.pct;
+  pctSet = true;
   const w = window.open("", "_blank");
   if (!w) return "popup blocked";
   w.document.open();
-  w.document.write(printDoc(res.rows));
+  w.document.write(printDoc(res.rows, res.pct));
   w.document.close();
   setTimeout(() => { try { w.focus(); w.print(); } catch (e) { /* user can print manually */ } }, 200);
   return null;
@@ -759,6 +926,8 @@ function floatingUi() {
   head.appendChild(close);
 
   sumBox = el("div", "tsc-sum");
+  rateBox = el("div", "tsc-rate");
+  rateBox.hidden = true;
 
   // ---- tools strip: house rate, refresh all, print
   toolsBox = el("div", "tsc-tools");
@@ -773,7 +942,12 @@ function floatingUi() {
   globalInput.title = "Applies to every row that has no percent of its own.";
   globalInput.addEventListener("change", async () => {
     const res = await send({ type: "setGlobalPct", pct: globalInput.value.trim() });
-    if (res.ok) renderList();
+    if (!res.ok) return;
+    // Blanking the box is refused by the worker, so put the live rate back rather than
+    // leaving an empty field that disagrees with what every row is priced at.
+    globalInput.value = String(res.pct);
+    pctSet = !!res.pctSet;
+    renderList();
   });
   toolsBox.appendChild(globalInput);
   toolsBox.appendChild(el("span", "tsc-gap"));
@@ -785,10 +959,25 @@ function floatingUi() {
   refreshBtn.title = "Re-pull every collected row at today's rate.";
   const REFRESH_LABEL = "Refresh prices";
   let refreshRevert = 0;
+  let refreshing = false;
+
+  // A 50-row collection is 50 sequential paging runs. The worker streams its position
+  // and the button doubles as the way out, so the run is never a frozen label with no
+  // end in sight and no way to stop it.
+  refreshProgress = (done, total) => {
+    if (!refreshing) return;
+    miniLabel(refreshBtn, "close", `Cancel (${done}/${total})`);
+    note(`Refreshing prices: ${done} of ${total} done. Click Cancel to stop.`);
+  };
+
   refreshBtn.addEventListener("click", async () => {
+    if (refreshing) { send({ type: "cancelRefresh" }); return; }
+
     clearTimeout(refreshRevert);
-    refreshBtn.disabled = true;
+    refreshing = true;
+    failedKeys = new Set();
     refreshBtn.setAttribute("aria-busy", "true");
+    refreshBtn.title = "Stop the refresh. Rows already done keep their new prices.";
     miniLabel(refreshBtn, "refresh", "Refreshing");
 
     let res;
@@ -797,13 +986,15 @@ function floatingUi() {
     } catch (e) {
       res = { ok: false };
     }
+    refreshing = false;
     refreshBtn.removeAttribute("aria-busy");
-    refreshBtn.disabled = false;
+    if (res && res.ok && res.failedKeys) failedKeys = new Set(res.failedKeys);
 
     // An FX outage is a partial failure, not a success: the prices moved but the rate
     // did not, so every CAD figure is yesterday's. Say so instead of reporting "done".
     let outcome = null;
     if (!res || !res.ok) outcome = "Refresh failed";
+    else if (res.cancelled) outcome = `Stopped, ${res.remaining} left`;
     else if (res.failed) outcome = `${res.refreshed} done, ${res.failed} failed`;
     else if (res.fxFailed) outcome = `${res.refreshed} done, rate unavailable`;
     else if (res.skipped) outcome = `${res.refreshed} done, ${res.skipped} removed`;
@@ -812,6 +1003,12 @@ function floatingUi() {
     refreshBtn.title = outcome && res && res.fxFailed
       ? "The exchange-rate lookup failed. Rows kept their last known rate."
       : "Re-pull every collected row at today's rate.";
+    // Which rows failed, named in the drawer rather than left as a count to hunt for.
+    note(res && res.ok
+      ? (outcome || `Refreshed ${res.refreshed} row${res.refreshed === 1 ? "" : "s"}.`)
+        + (failedKeys.size ? " The rows it could not re-pull are flagged in the drawer."
+          : "")
+      : "Refresh failed.");
     // The label always finds its way home. It used to stick on the failure text until
     // the next refresh, leaving a button that no longer said what it did.
     if (outcome) {
@@ -820,7 +1017,7 @@ function floatingUi() {
     renderList();
   });
 
-  const printBtn = el("button", "tsc-mini");
+  printBtn = el("button", "tsc-mini");
   printBtn.type = "button";
   printBtn.appendChild(icon("print", 13));
   printBtn.appendChild(document.createTextNode("Print sheet"));
@@ -887,7 +1084,7 @@ function floatingUi() {
 
   exportBtns = [copyBtn, csvBtn, clearBtn];
   foot.append(copyBtn, csvBtn, clearBtn);
-  drawer.append(head, sumBox, toolsBox, listBox, foot);
+  drawer.append(head, sumBox, rateBox, toolsBox, listBox, foot);
 
   pill = el("button", "tsc-pill");
   pill.type = "button";
@@ -918,6 +1115,7 @@ function toggleDrawer(open) {
 let noteBox;
 
 function note(text, strong) {
+  if (!noteBox) return;
   noteBox.textContent = "";
   if (strong) {
     const b = el("b", null, strong);
@@ -1070,6 +1268,16 @@ async function init() {
   }
 }
 
-// last: everything above uses `let` bindings that must be initialised first
-readUrl();
-if (PID) start();
+// The pure parts - the money arithmetic, the printed document, the undo wording - are
+// exported so `node test.js` can hold them to the same standard as the worker's. There
+// is no DOM in any of them.
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    round2, pctFor, tradeUnit, tradeLine, printDoc, undoOutcome, lowSamples,
+    LOW_SAMPLES, STALE_DAYS
+  };
+} else {
+  // last: everything above uses `let` bindings that must be initialised first
+  readUrl();
+  if (PID) start();
+}

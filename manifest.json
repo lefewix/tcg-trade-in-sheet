@@ -12,7 +12,8 @@
   "permissions": ["storage", "downloads", "clipboardWrite"],
   "host_permissions": [
     "https://mpapi.tcgplayer.com/*",
-    "https://open.er-api.com/*"
+    "https://open.er-api.com/*",
+    "https://api.frankfurter.dev/*"
   ],
   "background": {
     "service_worker": "background.js"

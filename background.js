@@ -11,28 +11,35 @@
 // back logged-out-shaped and looksLoggedOut() below catches it.
 
 const API = "https://mpapi.tcgplayer.com/v2/product";
-const FX_URL = "https://open.er-api.com/v6/latest/USD";
 
 const PAGE_SIZE = 25;   // server cap; a larger `limit` is ignored
 const MAX_PAGES = 10;   // a rare condition on a busy product must not spin forever
 const SAMPLES = 5;
 const STALE_DAYS = 60;
+const LOW_SAMPLES = 3;  // fewer than this and the price is one or two sales' opinion
 const STORE_KEY = "rows";
 const PCT_KEY = "pct";
 const DEFAULT_PCT = 100;
 
 // Exported columns. Everything else a stored row carries is underscore-prefixed and
-// stays out of the spreadsheet (sample count, staleness, FX rate, source URL, timestamp).
+// stays out of the spreadsheet (language, staleness flag, source URL, timestamp).
 const COLUMNS = ["name", "set", "number", "printing", "condition", "avg_usd", "cad", "qty"];
+
+// How much to trust the row. A $400 card priced off ONE sale from months ago must not
+// print identically to one backed by five recent sales, so the confidence signals the
+// worker already collects ship with the numbers instead of dying in the store.
+//   samples - how many sales went into avg_usd (fewer than 3 is thin)
+//   oldest  - date of the oldest sale in that average
+const TRUST_COLUMNS = ["samples", "oldest"];
 
 // What actually leaves the extension. `cad` is market price; the three trade columns are
 // what you would pay. Both numbers ship, explicitly labelled, because a sheet carrying
 // only market price gets quoted at market price and the whole margin walks out the door.
 //   pct         - the percent applied to this row (its override, else the house rate)
-//   trade_cad   - market cad * pct/100, one copy
-//   trade_total - trade_cad * qty
+//   trade_cad   - market cad * pct/100, one copy, ROUNDED TO THE CENT
+//   trade_total - that rounded unit * qty
 const TRADE_COLUMNS = ["pct", "trade_cad", "trade_total"];
-const EXPORT_COLUMNS = COLUMNS.concat(TRADE_COLUMNS);
+const EXPORT_COLUMNS = COLUMNS.concat(TRUST_COLUMNS, TRADE_COLUMNS);
 
 // ---------------------------------------------------------------- sales API
 
@@ -119,15 +126,27 @@ function salePrice(row) {
   return null;
 }
 
-function saleTime(row) {
+// A parseable date is not a plausible one. The window is sorted newest-first and cut at
+// five, so ONE row dated next year sorts to the top and IS the price - a single garbage
+// timestamp turned a $10.00 average into $2007.80 with no staleness flag, because the
+// row it displaced was never in the window to be judged. A sale that has not happened
+// yet, or that predates the hobby, is as unusable as a null price.
+const FUTURE_SKEW_MS = 86400000;            // 1 day: timezone and clock skew, nothing more
+const MAX_AGE_MS = 3650 * 86400000;         // ~10 years
+
+function saleTime(row, now) {
   const v = row && row.orderDate;
   if (typeof v !== "string" && typeof v !== "number") return null;
   const t = Date.parse(v);
-  return Number.isFinite(t) ? t : null;
+  if (!Number.isFinite(t)) return null;
+  now = now || Date.now();
+  if (t > now + FUTURE_SKEW_MS) return null;
+  if (t < now - MAX_AGE_MS) return null;
+  return t;
 }
 
-function isUsableSale(row) {
-  return salePrice(row) !== null && saleTime(row) !== null;
+function isUsableSale(row, now) {
+  return salePrice(row) !== null && saleTime(row, now) !== null;
 }
 
 async function collectSales(productId, sel, fetchPage) {
@@ -155,23 +174,81 @@ async function collectSales(productId, sel, fetchPage) {
 }
 
 // ---------------------------------------------------------------- FX
+//
+// This tool hands somebody a price in CAD, so a single point of failure in the currency
+// conversion means a customer at the counter and a blank column. Two providers, tried in
+// order, and the winner is persisted - MV3 kills the worker after ~30s idle, so a
+// module-level variable was a cache that never survived to be used.
+//
+// `date` is the rate's OWN date, not when we fetched it. Frankfurter is ECB data,
+// published on weekdays only, so a Sunday fetch legitimately returns Friday's rate. The
+// difference matters when somebody asks what a sheet was priced at.
+const FX_KEY = "fx";
+const FX_TTL_MS = 12 * 3600 * 1000;
 
-let fxCache = null; // { rate, at } - one successful fetch per worker session
+function isoDay(t) {
+  return Number.isFinite(t) ? new Date(t).toISOString().slice(0, 10) : "";
+}
 
-async function getFx() {
-  if (fxCache) return fxCache;
-  try {
-    const res = await fetch(FX_URL);
-    const json = await res.json();
-    const rate = json && json.rates && json.rates.CAD;
-    if (typeof rate !== "number") throw new Error("no CAD rate");
-    fxCache = { rate, at: new Date().toISOString() };
-    return fxCache;
-  } catch (e) {
-    // Failures are NOT cached: retry on the next add. cad ends up an empty string.
-    // Never 0, never 1.0, never a hardcoded rate.
-    return { rate: null, at: "" };
+const FX_PROVIDERS = [
+  {
+    src: "er-api",
+    url: "https://open.er-api.com/v6/latest/USD",
+    read: j => ({
+      rate: j && j.rates && j.rates.CAD,
+      date: j && j.time_last_update_utc ? isoDay(Date.parse(j.time_last_update_utc)) : ""
+    })
+  },
+  {
+    src: "frankfurter",
+    url: "https://api.frankfurter.dev/v1/latest?base=USD&symbols=CAD",
+    read: j => ({ rate: j && j.rates && j.rates.CAD, date: (j && j.date) || "" })
   }
+];
+
+// No module-level memo on purpose: chrome.storage.local IS the cache, so a worker that
+// was just restarted reads the same rate the previous one fetched instead of hitting the
+// network again (or, when both providers are down, handing back a blank).
+async function readFxCache() {
+  try {
+    const got = await chrome.storage.local.get(FX_KEY);
+    const c = got[FX_KEY];
+    return c && typeof c.rate === "number" && c.rate > 0 ? c : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function getFx(now) {
+  now = now || Date.now();
+  const cached = await readFxCache();
+  if (cached && now - Date.parse(cached.at) < FX_TTL_MS) return cached;
+
+  for (const p of FX_PROVIDERS) {
+    try {
+      const res = await fetch(p.url);
+      const json = await res.json();
+      const got = p.read(json);
+      if (typeof got.rate !== "number" || !Number.isFinite(got.rate) || got.rate <= 0) {
+        throw new Error("no CAD rate");
+      }
+      const fx = {
+        rate: got.rate,
+        at: new Date(now).toISOString(),
+        date: got.date || isoDay(now),
+        src: p.src
+      };
+      try { await chrome.storage.local.set({ [FX_KEY]: fx }); } catch (e) { /* non-fatal */ }
+      return fx;
+    } catch (e) { /* fall through to the next provider */ }
+  }
+
+  // Everything down. A cache past its TTL is still a real rate somebody once fetched, and
+  // it ships with its own date so the sheet can say how old it is - that beats a blank
+  // column at a counter. With nothing cached at all, cad stays an empty string:
+  // never 0, never 1.0, never a hardcoded rate.
+  if (cached) return Object.assign({}, cached, { expired: true });
+  return { rate: null, at: "", date: "", src: "" };
 }
 
 // ---------------------------------------------------------------- row build
@@ -182,9 +259,9 @@ function buildRow(meta, sel, matched, fx, now) {
   // Unreadable rows are dropped here as well as in collectSales, so a caller that hands
   // buildRow a raw array cannot produce a NaN price either.
   const used = matched
-    .filter(isUsableSale)
-    .sort((a, b) => saleTime(b) - saleTime(a))   // newest first
-    .slice(0, SAMPLES);                          // ...so this keeps the MOST RECENT 5
+    .filter(r => isUsableSale(r, now))
+    .sort((a, b) => saleTime(b, now) - saleTime(a, now))   // newest first
+    .slice(0, SAMPLES);                                    // ...so this keeps the MOST RECENT 5
 
   if (!used.length) {
     throw new Error("no sale had a readable purchase price and order date");
@@ -200,7 +277,7 @@ function buildRow(meta, sel, matched, fx, now) {
 
   // Sorted descending, so the last one is the oldest. UTC from the API - never the
   // UI's localized display, which disagrees by up to a day.
-  const oldestAt = saleTime(used[used.length - 1]);
+  const oldestAt = saleTime(used[used.length - 1], now);
   const ageDays = (now - oldestAt) / 86400000;
 
   const rate = fx && typeof fx.rate === "number" ? fx.rate : null;
@@ -220,6 +297,8 @@ function buildRow(meta, sel, matched, fx, now) {
     _stale: ageDays > STALE_DAYS,
     _fx_rate: rate === null ? "" : rate.toFixed(4),
     _fx_at: rate === null ? "" : fx.at,
+    _fx_date: rate === null ? "" : (fx.date || ""),
+    _fx_src: rate === null ? "" : (fx.src || ""),
     _url: meta.url
   };
 }
@@ -229,13 +308,41 @@ function buildRow(meta, sel, matched, fx, now) {
 // A cell whose first character is one of = + - @ is a FORMULA to Excel, Sheets and
 // LibreOffice - it executes on open, and card names are attacker-supplied text from a
 // marketplace listing. A leading apostrophe forces it back to text in every one of them.
-// Tab/CR at the start get the same treatment: they are stripped by some importers,
-// re-exposing the character behind them.
-const RISKY_LEAD = /^[=+\-@\t\r]/;
+//
+// But `+`, `-` and `@` also START REAL CARD NAMES: "+2 Mace", "-1/-1 Counter", "@Ninja".
+// Prefixing those corrupted the name on every path out of the tool - the CSV, the
+// clipboard, and back again through any spreadsheet the shop keeps. So the leading
+// character alone is not the test; what follows it is.
+//
+// Neutralised:                        Left alone:
+//   =anything                           +2 Mace
+//   =HYPERLINK(..) @SUM(1,2)            -1/-1 Counter
+//   +1+1  -2+3  +A1*2                   @Ninja
+//
+// `=` and a leading tab/CR are unconditional: `=` never begins a card name, and the
+// whitespace leads are stripped by some importers, re-exposing the character behind them.
+const ALWAYS_RISKY = /^[=\t\r\n]/;
+
+// sigil then an identifier then "(" - a function call: =HYPERLINK(, @SUM(, +IMPORTXML(
+const FORMULA_CALL = /^[=+\-@][A-Za-z_][\w.]*\s*\(/;
+
+// sigil then an expression made only of arithmetic and spreadsheet cell references:
+// +1+1, -2+3, -(1+2), +A1*2, @AA10:B4. The one thing it cannot contain is an ordinary
+// WORD, and a word is exactly what a card name starting with a sign always carries:
+// "Mace", "Counter" and "Ninja" are not one-to-three letters followed by digits.
+//
+// The two branches are disjoint on their first character - the plain class has no letter
+// and no `$`, a reference must start with one - so there is no ambiguity to backtrack
+// through on a long hostile name.
+const FORMULA_EXPR = /^[+\-@](?:[-+*/^%()0-9.,: ]|\$?[A-Za-z]{1,3}\$?\d+)*$/;
+
+function looksLikeFormula(s) {
+  return ALWAYS_RISKY.test(s) || FORMULA_CALL.test(s) || FORMULA_EXPR.test(s);
+}
 
 function neutralise(v) {
   const s = v === null || v === undefined ? "" : String(v);
-  return RISKY_LEAD.test(s) ? "'" + s : s;
+  return looksLikeFormula(s) ? "'" + s : s;
 }
 
 function csvCell(v) {
@@ -266,20 +373,32 @@ function rowPct(row, globalPct) {
   return row._pct === undefined || row._pct === null ? globalPct : row._pct;
 }
 
-// Decorates stored rows with the trade columns so the export carries both the market
-// price and the price you would actually pay. Empty (not 0) when FX is missing, matching
-// how `cad` itself behaves.
+// You cannot pay a fraction of a cent, so the unit price is rounded ONCE and every other
+// number is built from the rounded figure. Rounding the unit for display while
+// multiplying the raw one for the total is how a printed sheet stops adding up:
+// 12.99 at 65% is 8.44 a copy, and three copies is 25.32, not the 25.33 that
+// 8.4435 x 3 gives. A customer-facing document that fails its own arithmetic is
+// the one thing this tool cannot do.
+const round2 = n => Math.round((n + Number.EPSILON) * 100) / 100;
+
+// Decorates stored rows with the trust and trade columns so the export carries the market
+// price, the price you would actually pay, and how much the number is worth trusting.
+// Empty (not 0) when FX is missing, matching how `cad` itself behaves.
 function withTrade(rows, globalPct) {
   return rows.map(row => {
     const pct = rowPct(row, globalPct);
     const qty = Math.max(1, Math.round(Number(row.qty) || 1));
     const market = row.cad === "" || row.cad === undefined || row.cad === null
       ? null : Number(row.cad);
-    const unit = market === null || !Number.isFinite(market) ? null : market * pct / 100;
+    const unit = market === null || !Number.isFinite(market)
+      ? null : round2(market * pct / 100);
     return Object.assign({}, row, {
+      samples: row._samples === undefined || row._samples === null
+        ? "" : String(row._samples),
+      oldest: row._oldest || "",
       pct: String(pct),
       trade_cad: unit === null ? "" : unit.toFixed(2),
-      trade_total: unit === null ? "" : (unit * qty).toFixed(2)
+      trade_total: unit === null ? "" : round2(unit * qty).toFixed(2)
     });
   });
 }
@@ -328,15 +447,29 @@ function listRows(store) {
 // A stored 0 is a real house rate ("we are not paying for these"), not a missing one.
 // Per-row 0 was already honoured; coercing the global 0 to 100 made the same keystroke
 // mean two different things depending on which box you typed it in.
-async function getPct() {
+//
+// `set` is the other half of that answer, and it is not cosmetic. DEFAULT_PCT is 100, so
+// on a fresh install - or after cleared storage, or on a second machine - every row is
+// priced at 100% of market and nothing anywhere says so. Print that and you have handed
+// somebody a signed offer at full retail. The house rate is a decision the shop makes
+// once; until it has been made, `set` is false and the UI refuses to print.
+async function getPctState() {
   const got = await chrome.storage.local.get(PCT_KEY);
   const raw = got[PCT_KEY];
-  if (raw === undefined || raw === null || raw === "") return DEFAULT_PCT;
+  if (raw === undefined || raw === null || raw === "") return { pct: DEFAULT_PCT, set: false };
   const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_PCT;
+  return Number.isFinite(n) && n >= 0
+    ? { pct: n, set: true }
+    : { pct: DEFAULT_PCT, set: false };
+}
+
+async function getPct() {
+  return (await getPctState()).pct;
 }
 
 function clampPct(v) {
+  // Number("") is 0, and an empty box is "no answer", not "we pay nothing".
+  if (v === "" || v === null || v === undefined) return null;
   const n = Number(v);
   if (!Number.isFinite(n)) return null;
   return Math.min(1000, Math.max(0, Math.round(n * 10) / 10));
@@ -405,6 +538,8 @@ async function collect(msg, fetchPage) {
           row.cad = (Number(row.avg_usd) * rate).toFixed(2);
           row._fx_rate = prev._fx_rate;
           row._fx_at = prev._fx_at || "";
+          row._fx_date = prev._fx_date || "";
+          row._fx_src = prev._fx_src || "";
           row._fx_stale = true;
         }
       }
@@ -441,6 +576,26 @@ async function collect(msg, fetchPage) {
   };
 }
 
+// Progress and cancellation for the long-running refresh. A 50-row collection is 50
+// sequential paging runs; with no progress and no way out, the only honest option the
+// user had was to close the tab.
+let cancelRefresh = false;
+
+// The tab that asked for the current refresh. chrome.runtime.sendMessage from a service
+// worker reaches extension pages, NOT content scripts - a content script is only
+// addressable through chrome.tabs.sendMessage with its tab id, which the onMessage
+// listener below hands us from `sender`.
+let progressTab = null;
+
+function broadcast(msg) {
+  try {
+    if (progressTab === null || typeof chrome === "undefined" ||
+        !chrome.tabs || !chrome.tabs.sendMessage) return;
+    const p = chrome.tabs.sendMessage(progressTab, msg);
+    if (p && p.catch) p.catch(() => {});   // the tab closed or navigated: not our problem
+  } catch (e) { /* same */ }
+}
+
 // Re-pull every collected row at today's rate. Sequential on purpose: the sales API is
 // the bottleneck and a burst of parallel paging is how you get rate limited.
 async function refreshAll(fetchPage) {
@@ -450,8 +605,17 @@ async function refreshAll(fetchPage) {
   let failed = 0;
   let skipped = 0;   // deleted while the refresh was running
   let fxFailed = 0;  // re-priced against a stale rate because FX was down
+  // WHICH rows failed, not just how many: "47 done, 3 failed" leaves you to find the 3
+  // by eye across a drawer of 50.
+  const failedKeys = [];
+  let cancelled = false;
+  let done = 0;
+
+  cancelRefresh = false;
+  broadcast({ type: "refreshProgress", done: 0, total: keys.length });
 
   for (const key of keys) {
+    if (cancelRefresh) { cancelled = true; break; }
     const row = store[key];
     const productId = key.split("|")[0];
     const sel = {
@@ -470,21 +634,30 @@ async function refreshAll(fetchPage) {
         skipped++;
       } else {
         failed++;
+        failedKeys.push(key);
       }
     } catch (e) {
       failed++;
+      failedKeys.push(key);
     }
+    done++;
+    broadcast({ type: "refreshProgress", done, total: keys.length });
   }
+
+  broadcast({ type: "refreshProgress", done, total: keys.length, finished: true });
 
   return {
     ok: true,
     refreshed,
     failed,
+    failedKeys,
     skipped,
     fxFailed,
+    cancelled,
+    remaining: keys.length - done,
     // Anything less than a clean sweep is reported, so an FX outage cannot quietly leave
     // the collection priced at yesterday's rate while the button says it worked.
-    partial: failed > 0 || fxFailed > 0,
+    partial: failed > 0 || fxFailed > 0 || cancelled,
     count: Object.keys(await loadStore()).length
   };
 }
@@ -524,9 +697,13 @@ async function handle(msg, fetchPage) {
       return collect(msg, fetchPage);
     case "refreshAll":
       return refreshAll(fetchPage);
+    case "cancelRefresh":
+      cancelRefresh = true;
+      return { ok: true };
     case "list": {
       const rows = listRows(await loadStore());
-      return { ok: true, rows, count: rows.length, pct: await getPct() };
+      const pct = await getPctState();
+      return { ok: true, rows, count: rows.length, pct: pct.pct, pctSet: pct.set };
     }
     case "setQty":
       return withStore(store => {
@@ -547,8 +724,14 @@ async function handle(msg, fetchPage) {
       });
     case "setGlobalPct": {
       const pct = clampPct(msg.pct);
-      await chrome.storage.local.set({ [PCT_KEY]: pct === null ? DEFAULT_PCT : pct });
-      return { ok: true, pct: await getPct() };
+      // Blanking the box is not choosing a rate. It used to store DEFAULT_PCT, which
+      // would have counted as the first-run decision without anybody making one.
+      if (pct === null) {
+        const st = await getPctState();
+        return { ok: true, pct: st.pct, pctSet: st.set };
+      }
+      await chrome.storage.local.set({ [PCT_KEY]: pct });
+      return { ok: true, pct, pctSet: true };
     }
     // Undo is SURGICAL. It hands back a snapshot plus the exact keys the action removed,
     // and restore puts back only those - never the whole store.
@@ -609,6 +792,10 @@ async function handle(msg, fetchPage) {
 
 if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage) {
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    // Remember who asked, so a long refresh can stream its position back to that drawer.
+    if (msg && msg.type === "refreshAll" && sender && sender.tab) {
+      progressTab = sender.tab.id;
+    }
     handle(msg).then(
       sendResponse,
       err => sendResponse({ ok: false, error: String((err && err.message) || err) })
@@ -620,10 +807,11 @@ if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage)
 // node-runnable tests import the pure functions from here
 if (typeof module !== "undefined") {
   module.exports = {
-    COLUMNS, TRADE_COLUMNS, EXPORT_COLUMNS,
-    MAX_PAGES, PAGE_SIZE, SAMPLES, STALE_DAYS, DEFAULT_PCT,
+    COLUMNS, TRADE_COLUMNS, TRUST_COLUMNS, EXPORT_COLUMNS,
+    MAX_PAGES, PAGE_SIZE, SAMPLES, STALE_DAYS, LOW_SAMPLES, DEFAULT_PCT,
     matchesSelection, collectSales, buildRow, toDelimited, looksLoggedOut,
     getFx, collect, handle, fetchSalesPage, refreshAll, listRows, clampPct,
-    csvCell, tsvCell, isUsableSale, salePrice, saleTime, withTrade, getPct
+    csvCell, tsvCell, isUsableSale, salePrice, saleTime, withTrade, getPct,
+    getPctState, neutralise, round2
   };
 }
