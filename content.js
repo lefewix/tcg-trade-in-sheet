@@ -542,7 +542,9 @@ async function renderList() {
       paid === null ? "no rate" : money(paid) + " CAD");
     if (row._fx_rate) {
       cad.title = `${row.cad} CAD market at ${rowPct(row)}%. `
-        + `Converted at ${row._fx_rate}, fetched ${row._fx_at}`;
+        + `Converted at ${row._fx_rate}, fetched ${row._fx_at}`
+        + (row._fx_stale ? ". The last refresh could not reach the rate service, "
+          + "so this is the previous rate." : "");
     }
     price.appendChild(cad);
 
@@ -578,9 +580,12 @@ async function renderList() {
     del.title = "Remove from collection";
     del.setAttribute("aria-label", `Remove ${row.name}`);
     del.addEventListener("click", async () => {
+      // Disabled for the round trip: a second click on an already-removed row is a
+      // no-op, and a no-op toast must never take the place of the live undo.
+      del.disabled = true;
       const res2 = await send({ type: "remove", key: row.key });
       renderList();
-      if (res2.ok) undoToast(`Removed ${row.name}`, res2.prev);
+      if (res2.ok) undoToast(`Removed ${row.name}`, res2.prev, res2.keys);
     });
 
     item.append(text, price, pct, qty, del);
@@ -597,11 +602,12 @@ async function renderList() {
 
 // ---------------------------------------------------------------- undo
 
-// One toast at a time. `prev` is the entire store as it was before the destructive
-// action, so undo puts back exactly that - not a reconstruction of it.
+// One toast at a time. `prev` is the store as it was before the destructive action and
+// `keys` names exactly what that action removed - the worker puts back only those, and
+// only where nothing newer has taken their place. Undo never deletes.
 let toastEl = null, toastTimer = 0;
 
-function undoToast(text, prev) {
+function undoToast(text, prev, keys) {
   if (toastEl) toastEl.remove();
   clearTimeout(toastTimer);
 
@@ -613,7 +619,7 @@ function undoToast(text, prev) {
   btn.type = "button";
   btn.addEventListener("click", async () => {
     dismissToast(t);
-    await send({ type: "restore", store: prev });
+    await send({ type: "restore", store: prev, keys });
     renderList();
   });
   t.appendChild(btn);
@@ -777,17 +783,40 @@ function floatingUi() {
   refreshBtn.appendChild(icon("refresh", 13));
   refreshBtn.appendChild(document.createTextNode("Refresh prices"));
   refreshBtn.title = "Re-pull every collected row at today's rate.";
+  const REFRESH_LABEL = "Refresh prices";
+  let refreshRevert = 0;
   refreshBtn.addEventListener("click", async () => {
-    const label_ = "Refresh prices";
+    clearTimeout(refreshRevert);
     refreshBtn.disabled = true;
     refreshBtn.setAttribute("aria-busy", "true");
     miniLabel(refreshBtn, "refresh", "Refreshing");
-    const res = await send({ type: "refreshAll" });
+
+    let res;
+    try {
+      res = await send({ type: "refreshAll" });
+    } catch (e) {
+      res = { ok: false };
+    }
     refreshBtn.removeAttribute("aria-busy");
     refreshBtn.disabled = false;
-    miniLabel(refreshBtn, "refresh", res.ok && res.failed
-      ? `${res.refreshed} done, ${res.failed} failed`
-      : label_);
+
+    // An FX outage is a partial failure, not a success: the prices moved but the rate
+    // did not, so every CAD figure is yesterday's. Say so instead of reporting "done".
+    let outcome = null;
+    if (!res || !res.ok) outcome = "Refresh failed";
+    else if (res.failed) outcome = `${res.refreshed} done, ${res.failed} failed`;
+    else if (res.fxFailed) outcome = `${res.refreshed} done, rate unavailable`;
+    else if (res.skipped) outcome = `${res.refreshed} done, ${res.skipped} removed`;
+
+    miniLabel(refreshBtn, "refresh", outcome || REFRESH_LABEL);
+    refreshBtn.title = outcome && res && res.fxFailed
+      ? "The exchange-rate lookup failed. Rows kept their last known rate."
+      : "Re-pull every collected row at today's rate.";
+    // The label always finds its way home. It used to stick on the failure text until
+    // the next refresh, leaving a button that no longer said what it did.
+    if (outcome) {
+      refreshRevert = setTimeout(() => miniLabel(refreshBtn, "refresh", REFRESH_LABEL), 4000);
+    }
     renderList();
   });
 
@@ -851,7 +880,8 @@ function floatingUi() {
     const res = await send({ type: "clear" });
     renderList();
     if (res.ok && res.cleared) {
-      undoToast(`Cleared ${res.cleared} row${res.cleared === 1 ? "" : "s"}`, res.prev);
+      undoToast(`Cleared ${res.cleared} row${res.cleared === 1 ? "" : "s"}`,
+        res.prev, res.keys);
     }
   });
 
@@ -1008,15 +1038,22 @@ async function init() {
   if (!res.ok) { alert_(body, "Could not read sales: " + res.error, true); return; }
   setCount(res.count);
 
-  if (res.loggedOut) {
-    alert_(body, "Sign in to TCGplayer. Signed out, the sales feed stops at 5 rows.");
-    return;
-  }
-
   const groups = combos(res.rows);
   if (!groups.length) { alert_(body, "No recent sales on this product."); return; }
 
   body.textContent = "";
+
+  // Exactly 5 sales and no next page is the signed-out truncation signature - but it is
+  // also what a genuinely quiet product looks like, so this is a warning above working
+  // chips, never a block. Blocking on it hid every quiet product behind a wrong reason.
+  if (res.loggedOut) {
+    const warn = el("p", "tsc-alert");
+    warn.textContent = "Only 5 sales came back and there is no next page. "
+      + "That is all this product has, or you are signed out of TCGplayer - "
+      + "signed out, the feed stops at 5 rows. Sign in for the full history.";
+    body.appendChild(warn);
+  }
+
   const have = new Set(res.haveKeys || []);
   for (const g of groups) {
     const wrap = el("div", "tsc-grp");

