@@ -42,8 +42,27 @@ the spreadsheet.
 ## Collection
 
 Rows are keyed by product, printing, condition, and language, so the same card in two
-languages does not collide. Re-adding a row overwrites it with a fresh pull and keeps the
-qty you typed.
+languages does not collide. Clicking a grade you already collected re-pulls the price and
+adds a copy; shift-click re-pulls the price and leaves the count alone. The drawer lists
+newest first and flashes the row it just touched.
+
+Every store write goes through one promise chain in the service worker, so two grades
+clicked a beat apart cannot overwrite each other.
+
+Clear and per-row delete both offer an undo for five seconds, and restore the exact prior
+state. Refresh prices re-pulls every collected row at today's rate.
+
+## Trade-in percent
+
+The drawer carries a house rate that every row follows, and any row can override it with
+its own percent. The override drives that row's CAD, the trade-in total, and the printable
+sheet. The CSV and the clipboard copy stay at market CAD.
+
+## Print sheet
+
+Print sheet opens a plain, customer-facing table - card, set, printing, condition, qty,
+unit CAD, line total, and the grand total - in a new tab, ready to print. No dependencies:
+the document is generated in place.
 
 ## Tests
 
@@ -53,4 +72,5 @@ node test.js
 
 No framework, no network. The fixture is shaped from a live `latestsales` response and
 covers the matching rules, the average, paging and the 10-page cap, the exchange-rate
-failure path, and the overwrite behaviour.
+failure path, the overwrite behaviour, serialized concurrent writes, qty increments,
+refresh-all, and the drawer sort order.

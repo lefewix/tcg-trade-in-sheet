@@ -35,6 +35,9 @@ const ICONS = {
   copy: ["M9 8.6h9a1.6 1.6 0 0 1 1.6 1.6v9a1.6 1.6 0 0 1-1.6 1.6h-9A1.6 1.6 0 0 1 7.4 19.2v-9A1.6 1.6 0 0 1 9 8.6Z",
          "M4.8 15.4A1.6 1.6 0 0 1 3.2 13.8v-9A1.6 1.6 0 0 1 4.8 3.2h9a1.6 1.6 0 0 1 1.6 1.6"],
   download: ["M12 3.6v11.2", "M16.2 10.6 12 14.8 7.8 10.6", "M4 19.8h16"],
+  refresh: ["M20.4 12a8.4 8.4 0 1 1-2.5-6", "M20.4 4.2v4.6h-4.6"],
+  print: ["M7.4 9V3.6h9.2V9", "M7.4 17.4H5.6A1.6 1.6 0 0 1 4 15.8v-5.2A1.6 1.6 0 0 1 5.6 9h12.8a1.6 1.6 0 0 1 1.6 1.6v5.2a1.6 1.6 0 0 1-1.6 1.6h-1.8",
+          "M7.4 14.4h9.2V20H7.4Z"],
   trash: ["M4.6 6.9h14.8", "M10 10.9v6", "M14 10.9v6",
           "M6.7 6.9l.8 11.9a1.8 1.8 0 0 0 1.8 1.7h5.4a1.8 1.8 0 0 0 1.8-1.7l.8-11.9",
           "M9.5 6.9V5a1.4 1.4 0 0 1 1.4-1.4h2.2A1.4 1.4 0 0 1 14.5 5v1.9"]
@@ -260,7 +263,22 @@ function style() {
       text-align:center}
     .tsc-badge[data-zero="1"]{background:#2a2833;color:var(--tsc-mut)}
 
-    .tsc-drawer{width:min(436px,calc(100vw - 36px));max-height:min(66vh,600px);
+    /* undo toast: sits above the drawer, same surface language as everything else */
+    .tsc-toast{display:flex;align-items:center;gap:12px;padding:10px 11px 10px 14px;
+      max-width:min(436px,calc(100vw - 36px));
+      background:var(--tsc-bg);border:1px solid var(--tsc-hair);border-radius:var(--tsc-r-ctl);
+      box-shadow:var(--tsc-shadow);font-size:12px;color:var(--tsc-ink-2);
+      animation:tsc-rise .16s ease-out}
+    .tsc-toast-t{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .tsc-undo{flex:none;border:1px solid var(--tsc-line);border-radius:var(--tsc-r-chip);
+      background:#17171c;color:var(--tsc-ac-ink);cursor:pointer;padding:5px 10px;
+      font:12px/1 var(--tsc-sans);font-weight:600;
+      transition:background .15s ease,border-color .15s ease}
+    .tsc-undo:hover{background:var(--tsc-ac-tint);border-color:var(--tsc-ac-line)}
+    .tsc-undo:active{transform:translateY(1px)}
+    @keyframes tsc-rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+    .tsc-drawer{width:min(470px,calc(100vw - 36px));max-height:min(66vh,600px);
       display:none;flex-direction:column;background:var(--tsc-bg);
       border:1px solid var(--tsc-hair);border-radius:var(--tsc-r-box);
       box-shadow:0 16px 42px rgba(8,5,20,.55);overflow:hidden}
@@ -283,6 +301,33 @@ function style() {
     .tsc-sum-r{text-align:right}
     .tsc-sum-r .tsc-sum-v{color:var(--tsc-ac-ink)}
 
+    /* tools strip: the two settings-ish actions, kept out of the primary footer */
+    .tsc-tools{display:flex;align-items:center;gap:7px;padding:9px 12px 9px 14px;
+      border-bottom:1px solid var(--tsc-hair)}
+    .tsc-tools[hidden]{display:none}
+    .tsc-tools-k{font-size:11px;font-weight:500;letter-spacing:.01em;color:var(--tsc-mut)}
+    .tsc-gap{flex:1}
+    .tsc-mini{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;
+      border:1px solid var(--tsc-line);border-radius:var(--tsc-r-chip);background:#17171c;
+      color:var(--tsc-ink-2);cursor:pointer;font:11.5px/1 var(--tsc-sans);font-weight:600;
+      white-space:nowrap;transition:background .15s ease,border-color .15s ease,color .15s ease}
+    .tsc-mini:hover:not([disabled]){border-color:var(--tsc-hair-h);color:var(--tsc-ink)}
+    .tsc-mini:active:not([disabled]){transform:translateY(1px)}
+    .tsc-mini[disabled]{opacity:.45;cursor:default}
+    .tsc-mini[aria-busy="true"] .tsc-i{animation:tsc-spin 1s linear infinite}
+    @keyframes tsc-spin{to{transform:rotate(360deg)}}
+
+    .tsc-pct{width:52px;padding:5px 6px;border:1px solid var(--tsc-line);
+      border-radius:var(--tsc-r-chip);background:var(--tsc-inp);color:var(--tsc-ink-2);
+      font:11.5px var(--tsc-mono);font-variant-numeric:tabular-nums;text-align:center;
+      transition:background .15s ease,border-color .15s ease,color .15s ease}
+    .tsc-pct:hover{border-color:var(--tsc-hair-h)}
+    .tsc-pct:focus{border-color:var(--tsc-ac);color:var(--tsc-ink)}
+    /* a row that overrides the global percent wears the accent, so it is visible
+       at a glance which lines are priced off the house rate */
+    .tsc-pct[data-own="1"]{background:var(--tsc-ac-tint);border-color:var(--tsc-ac-line);
+      color:var(--tsc-ac-ink)}
+
     .tsc-list{overflow:auto;flex:1}
     .tsc-empty{display:flex;flex-direction:column;align-items:center;gap:10px;
       padding:34px 22px;text-align:center;color:var(--tsc-mut)}
@@ -290,10 +335,13 @@ function style() {
     .tsc-empty p{margin:3px 0 0;font-size:12px;max-width:26ch}
     .tsc-empty .tsc-mark{opacity:.4}
 
-    .tsc-item{display:grid;grid-template-columns:1fr auto auto auto;align-items:center;
-      gap:12px;padding:10px 14px;transition:background .15s ease}
+    .tsc-item{display:grid;grid-template-columns:1fr auto auto auto auto;align-items:center;
+      gap:10px;padding:10px 14px;transition:background .15s ease}
     .tsc-item + .tsc-item{border-top:1px solid var(--tsc-hair)}
     .tsc-item:hover{background:var(--tsc-row)}
+    /* the row you just touched, fading back to the list over ~1.5s */
+    .tsc-hit{animation:tsc-hit 1.5s ease-out}
+    @keyframes tsc-hit{from{background:var(--tsc-ac-tint)}to{background:transparent}}
     .tsc-t{min-width:0}
     .tsc-n{display:block;font-weight:600;color:var(--tsc-ink);text-decoration:none;
       white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:color .15s ease}
@@ -312,7 +360,7 @@ function style() {
     .tsc-cad{font:11px/1.25 var(--tsc-mono);color:var(--tsc-mut)}
     .tsc-cad.tsc-nofx{color:var(--tsc-warn)}
     /* brighter than the hairlines elsewhere: an input boundary needs to read as a field */
-    .tsc-q{width:54px;padding:5px 6px;border:1px solid var(--tsc-line);
+    .tsc-q{width:48px;padding:5px 6px;border:1px solid var(--tsc-line);
       border-radius:var(--tsc-r-ctl);background:var(--tsc-inp);color:var(--tsc-ink);
       font:12px var(--tsc-mono);font-variant-numeric:tabular-nums;text-align:center;
       transition:border-color .15s ease}
@@ -342,8 +390,11 @@ function style() {
 
     @media (prefers-reduced-motion:reduce){
       .tsc-panel *,.tsc-root *{animation:none!important;transition:none!important}
-      .tsc-chip:active:not([disabled]),.tsc-b:active,.tsc-pill:active{transform:none}
+      .tsc-chip:active:not([disabled]),.tsc-b:active,.tsc-pill:active,
+      .tsc-mini:active,.tsc-undo:active{transform:none}
       .tsc-busy::after{width:100%;opacity:.45}
+      /* no fade, so the tint simply holds until the next render */
+      .tsc-hit{background:var(--tsc-ac-tint)}
     }
   `;
   document.documentElement.appendChild(s);
@@ -381,7 +432,22 @@ const label = sel => `${sel.condition}, ${sel.variant}`;
 
 // ---------------------------------------------------------------- drawer
 
-let badge, drawer, listBox, sumBox, pill, exportBtns = [];
+let badge, drawer, listBox, sumBox, toolsBox, globalInput, pill, exportBtns = [];
+let globalPct = 100;
+let pendingHit = null;   // key of the row to flash on the next render
+
+const reduced = () =>
+  window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// A row's percent is its own override when it has one, otherwise the house rate.
+// undefined and "no override" are the same thing; 0 is a real (if odd) answer.
+const rowPct = row => (row._pct === undefined || row._pct === null ? globalPct : row._pct);
+
+// What you would actually pay for one copy. null when the FX fetch missed.
+function tradeCad(row) {
+  if (!row.cad) return null;
+  return parseFloat(row.cad) * rowPct(row) / 100;
+}
 
 function setCount(n) {
   if (!badge) return;
@@ -397,7 +463,7 @@ function renderSummary(rows) {
   const copies = rows.reduce((n, r) => n + (Number(r.qty) || 1), 0);
   const usd = rows.reduce((n, r) => n + parseFloat(r.avg_usd) * (Number(r.qty) || 1), 0);
   const priced = rows.filter(r => r.cad !== "");
-  const cad = priced.reduce((n, r) => n + parseFloat(r.cad) * (Number(r.qty) || 1), 0);
+  const cad = priced.reduce((n, r) => n + tradeCad(r) * (Number(r.qty) || 1), 0);
 
   // Two totals, and they can cover different rows: the CAD side skips anything the FX
   // fetch missed. Say so rather than let the numbers look like they disagree.
@@ -420,8 +486,14 @@ function renderSummary(rows) {
 async function renderList() {
   const res = await send({ type: "list" });
   if (!res.ok) return;
+  globalPct = res.pct;
+  if (globalInput && document.activeElement !== globalInput) {
+    globalInput.value = String(globalPct);
+  }
   setCount(res.count);
+  toolsBox.hidden = !res.rows.length;
   listBox.textContent = "";
+  let hitRow = null;
   // nothing to copy or export until something is in the store
   for (const b of exportBtns) b.disabled = !res.rows.length;
 
@@ -465,10 +537,28 @@ async function renderList() {
 
     const price = el("div", "tsc-p");
     price.appendChild(el("div", "tsc-usd", row.avg_usd + " USD"));
+    const paid = tradeCad(row);
     const cad = el("div", row.cad ? "tsc-cad" : "tsc-cad tsc-nofx",
-      row.cad ? row.cad + " CAD" : "no rate");
-    if (row._fx_rate) cad.title = `Converted at ${row._fx_rate}, fetched ${row._fx_at}`;
+      paid === null ? "no rate" : money(paid) + " CAD");
+    if (row._fx_rate) {
+      cad.title = `${row.cad} CAD market at ${rowPct(row)}%. `
+        + `Converted at ${row._fx_rate}, fetched ${row._fx_at}`;
+    }
     price.appendChild(cad);
+
+    // Per-row trade-in percent. Blank it to fall back to the house rate.
+    const pct = el("input", "tsc-pct");
+    pct.type = "number";
+    pct.min = "0";
+    pct.step = "1";
+    pct.value = String(rowPct(row));
+    pct.dataset.own = row._pct === undefined || row._pct === null ? "0" : "1";
+    pct.setAttribute("aria-label", `Trade-in percent for ${row.name}`);
+    pct.title = "Trade-in percent for this row. Clear it to follow the rate above.";
+    pct.addEventListener("change", async () => {
+      const res2 = await send({ type: "setPct", key: row.key, pct: pct.value.trim() });
+      if (res2.ok) { pendingHit = row.key; renderList(); }
+    });
 
     const qty = el("input", "tsc-q");
     qty.type = "number";
@@ -479,7 +569,7 @@ async function renderList() {
     qty.title = "How many copies you are trading in";
     qty.addEventListener("change", async () => {
       const res2 = await send({ type: "setQty", key: row.key, qty: qty.value });
-      if (res2.ok) { qty.value = String(res2.qty); renderList(); }
+      if (res2.ok) { qty.value = String(res2.qty); pendingHit = row.key; renderList(); }
     });
 
     const del = el("button", "tsc-del");
@@ -488,13 +578,134 @@ async function renderList() {
     del.title = "Remove from collection";
     del.setAttribute("aria-label", `Remove ${row.name}`);
     del.addEventListener("click", async () => {
-      await send({ type: "remove", key: row.key });
+      const res2 = await send({ type: "remove", key: row.key });
       renderList();
+      if (res2.ok) undoToast(`Removed ${row.name}`, res2.prev);
     });
 
-    item.append(text, price, qty, del);
+    item.append(text, price, pct, qty, del);
+    if (pendingHit === row.key) { item.classList.add("tsc-hit"); hitRow = item; }
     listBox.appendChild(item);
   }
+
+  pendingHit = null;
+  // scrollIntoView after the list is built, so the row is at its final offset
+  if (hitRow) {
+    hitRow.scrollIntoView({ block: "nearest", behavior: reduced() ? "auto" : "smooth" });
+  }
+}
+
+// ---------------------------------------------------------------- undo
+
+// One toast at a time. `prev` is the entire store as it was before the destructive
+// action, so undo puts back exactly that - not a reconstruction of it.
+let toastEl = null, toastTimer = 0;
+
+function undoToast(text, prev) {
+  if (toastEl) toastEl.remove();
+  clearTimeout(toastTimer);
+
+  const t = toastEl = el("div", "tsc-toast");
+  t.setAttribute("role", "status");
+  t.appendChild(el("span", "tsc-toast-t", text));
+
+  const btn = el("button", "tsc-undo", "Undo");
+  btn.type = "button";
+  btn.addEventListener("click", async () => {
+    dismissToast(t);
+    await send({ type: "restore", store: prev });
+    renderList();
+  });
+  t.appendChild(btn);
+
+  floatRoot.insertBefore(t, floatRoot.firstChild);
+  toastTimer = setTimeout(() => dismissToast(t), 5000);
+}
+
+function dismissToast(t) {
+  clearTimeout(toastTimer);
+  t.remove();
+  if (toastEl === t) toastEl = null;
+}
+
+// ---------------------------------------------------------------- print sheet
+
+const esc = s => String(s === null || s === undefined ? "" : s)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+// A customer-facing document, so it is light and boring on purpose: the drawer's dark
+// violet is our tool, not something to hand across a counter. Written into a blank
+// window rather than fetched from a template - no bundler, no extra file, no network.
+function printDoc(rows) {
+  const lines = rows.map(r => {
+    const qty = Number(r.qty) || 1;
+    const unit = tradeCad(r);
+    return {
+      name: r.name, set: r.set, printing: r.printing, condition: r.condition,
+      qty,
+      unit: unit === null ? null : unit,
+      total: unit === null ? null : unit * qty
+    };
+  });
+  const grand = lines.reduce((n, l) => n + (l.total || 0), 0);
+  const copies = lines.reduce((n, l) => n + l.qty, 0);
+  const missing = lines.filter(l => l.total === null).length;
+  const dash = "&#8212;";
+
+  const body = lines.map(l => `<tr>
+      <td>${esc(l.name)}</td><td>${esc(l.set)}</td><td>${esc(l.printing)}</td>
+      <td>${esc(l.condition)}</td><td class="n">${l.qty}</td>
+      <td class="n">${l.unit === null ? dash : money(l.unit)}</td>
+      <td class="n">${l.total === null ? dash : money(l.total)}</td>
+    </tr>`).join("");
+
+  return `<!doctype html><html><head><meta charset="utf-8">
+<title>Trade-in sheet ${new Date().toISOString().slice(0, 10)}</title>
+<style>
+  :root{--ac:#8b5cf6;--ink:#16151a;--mut:#6b6878;--line:#e4e2ea}
+  *{box-sizing:border-box}
+  body{margin:0;padding:34px 30px;color:var(--ink);background:#fff;
+    font:13px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+    font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+  header{display:flex;align-items:baseline;gap:10px;margin:0 0 18px}
+  h1{margin:0;font-size:17px;font-weight:700;letter-spacing:-.02em}
+  .date{font-size:11.5px;color:var(--mut)}
+  table{width:100%;border-collapse:collapse}
+  th{text-align:left;font-size:10.5px;font-weight:600;letter-spacing:.04em;color:var(--mut);
+    padding:0 8px 7px;border-bottom:1px solid var(--line)}
+  td{padding:8px;border-bottom:1px solid var(--line);vertical-align:top}
+  td:first-child{font-weight:600}
+  .n{text-align:right;white-space:nowrap;
+    font-family:ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace}
+  th.n{text-align:right}
+  tfoot td{border-bottom:0;border-top:2px solid var(--ink);font-weight:700;padding-top:11px}
+  tfoot .n{font-size:15px}
+  .note{margin:14px 0 0;font-size:11.5px;color:var(--mut)}
+  @media print{body{padding:0}thead{display:table-header-group}}
+</style></head><body>
+<header><h1>Trade-in sheet</h1>
+  <span class="date">${new Date().toLocaleDateString("en-CA")} &#183; ${rows.length} card${rows.length === 1 ? "" : "s"}, ${copies} cop${copies === 1 ? "y" : "ies"}</span>
+</header>
+<table><thead><tr>
+  <th>Card</th><th>Set</th><th>Printing</th><th>Condition</th>
+  <th class="n">Qty</th><th class="n">Unit CAD</th><th class="n">Line total</th>
+</tr></thead><tbody>${body}</tbody>
+<tfoot><tr><td colspan="6">Total offer</td><td class="n">${money(grand)}</td></tr></tfoot></table>
+${missing ? `<p class="note">${missing} row${missing === 1 ? "" : "s"} had no exchange rate and are excluded from the total.</p>` : ""}
+</body></html>`;
+}
+
+async function openPrintSheet() {
+  const res = await send({ type: "list" });
+  if (!res.ok || !res.rows.length) return "nothing to print";
+  globalPct = res.pct;
+  const w = window.open("", "_blank");
+  if (!w) return "popup blocked";
+  w.document.open();
+  w.document.write(printDoc(res.rows));
+  w.document.close();
+  setTimeout(() => { try { w.focus(); w.print(); } catch (e) { /* user can print manually */ } }, 200);
+  return null;
 }
 
 // Buttons that report their own outcome, then return to their resting label.
@@ -506,6 +717,12 @@ function flash(btn, text) {
     btn.appendChild(icon(btn.dataset.icon, 15));
     btn.appendChild(document.createTextNode(keep));
   }, 1600);
+}
+
+function miniLabel(btn, iconName, text) {
+  btn.textContent = "";
+  btn.appendChild(icon(iconName, 13));
+  btn.appendChild(document.createTextNode(text));
 }
 
 function actionButton(cls, iconName, text) {
@@ -536,6 +753,59 @@ function floatingUi() {
   head.appendChild(close);
 
   sumBox = el("div", "tsc-sum");
+
+  // ---- tools strip: house rate, refresh all, print
+  toolsBox = el("div", "tsc-tools");
+  toolsBox.hidden = true;
+  toolsBox.appendChild(el("span", "tsc-tools-k", "Trade-in rate"));
+  globalInput = el("input", "tsc-pct");
+  globalInput.type = "number";
+  globalInput.min = "0";
+  globalInput.step = "1";
+  globalInput.value = String(globalPct);
+  globalInput.setAttribute("aria-label", "Trade-in percent for every row without its own");
+  globalInput.title = "Applies to every row that has no percent of its own.";
+  globalInput.addEventListener("change", async () => {
+    const res = await send({ type: "setGlobalPct", pct: globalInput.value.trim() });
+    if (res.ok) renderList();
+  });
+  toolsBox.appendChild(globalInput);
+  toolsBox.appendChild(el("span", "tsc-gap"));
+
+  const refreshBtn = el("button", "tsc-mini");
+  refreshBtn.type = "button";
+  refreshBtn.appendChild(icon("refresh", 13));
+  refreshBtn.appendChild(document.createTextNode("Refresh prices"));
+  refreshBtn.title = "Re-pull every collected row at today's rate.";
+  refreshBtn.addEventListener("click", async () => {
+    const label_ = "Refresh prices";
+    refreshBtn.disabled = true;
+    refreshBtn.setAttribute("aria-busy", "true");
+    miniLabel(refreshBtn, "refresh", "Refreshing");
+    const res = await send({ type: "refreshAll" });
+    refreshBtn.removeAttribute("aria-busy");
+    refreshBtn.disabled = false;
+    miniLabel(refreshBtn, "refresh", res.ok && res.failed
+      ? `${res.refreshed} done, ${res.failed} failed`
+      : label_);
+    renderList();
+  });
+
+  const printBtn = el("button", "tsc-mini");
+  printBtn.type = "button";
+  printBtn.appendChild(icon("print", 13));
+  printBtn.appendChild(document.createTextNode("Print sheet"));
+  printBtn.title = "Open a clean, customer-facing sheet ready to print.";
+  printBtn.addEventListener("click", async () => {
+    const err = await openPrintSheet();
+    if (err) {
+      miniLabel(printBtn, "print", err);
+      setTimeout(() => miniLabel(printBtn, "print", "Print sheet"), 1800);
+    }
+  });
+
+  toolsBox.append(refreshBtn, printBtn);
+
   listBox = el("div", "tsc-list");
 
   const foot = el("div", "tsc-foot");
@@ -578,13 +848,16 @@ function floatingUi() {
     clearBtn.textContent = "";
     clearBtn.appendChild(icon("trash", 15));
     clearBtn.appendChild(document.createTextNode("Clear"));
-    await send({ type: "clear" });
+    const res = await send({ type: "clear" });
     renderList();
+    if (res.ok && res.cleared) {
+      undoToast(`Cleared ${res.cleared} row${res.cleared === 1 ? "" : "s"}`, res.prev);
+    }
   });
 
   exportBtns = [copyBtn, csvBtn, clearBtn];
   foot.append(copyBtn, csvBtn, clearBtn);
-  drawer.append(head, sumBox, listBox, foot);
+  drawer.append(head, sumBox, toolsBox, listBox, foot);
 
   pill = el("button", "tsc-pill");
   pill.type = "button";
@@ -642,30 +915,39 @@ function addChip(combo, sel, box, have) {
     chip.classList.add("tsc-thin");
     chip.title = "No sale in the last 25. Paging deeper may still find one.";
   }
+  const COLLECTED_TIP = "Collected. Click to add another copy, "
+    + "shift-click to refresh the price without changing the count.";
   if (have.has(`${PID}|${sel.variant}|${sel.condition}|${sel.language}`)) {
     setState("tsc-ok", "check");
-    chip.title = "Collected. Click to refresh with a new pull.";
+    chip.title = COLLECTED_TIP;
   }
 
-  chip.addEventListener("click", async () => {
+  chip.addEventListener("click", async e => {
+    // Both paths re-pull the price. The only difference is whether a copy is added.
+    const bump = !e.shiftKey;
     chip.disabled = true;
     chip.setAttribute("aria-busy", "true");
     setState("tsc-busy", null);
     note(`Paging sales for ${label(sel)}.`);
     try {
       const res = await send({
-        type: "collect", productId: PID, sel, meta: scrapePageMeta()
+        type: "collect", productId: PID, sel, meta: scrapePageMeta(),
+        mode: bump ? "bump" : "refresh"
       });
       if (res.ok) {
         setState("tsc-ok", "check");
-        const detail = [`${res.samples} sale${res.samples === 1 ? "" : "s"} averaged`,
-          `${res.rejected} rejected`]
+        const what = res.mode === "incremented"
+          ? [`+1 copy · ${res.qty} total`]
+          : res.mode === "refreshed" ? ["refreshed"] : [];
+        const detail = what.concat([`${res.samples} sale${res.samples === 1 ? "" : "s"} averaged`,
+          `${res.rejected} rejected`])
           .concat(res.capped ? ["stopped at the 10 page cap"] : [])
           .concat(res.stale ? ["oldest sale is over 60 days old"] : [])
           .concat(res.noFx ? ["no exchange rate, CAD left blank"] : []);
-        chip.title = detail.join(". ") + ".";
+        chip.title = detail.join(". ") + ". " + COLLECTED_TIP;
         note(detail.join(", ") + ".", label(sel) + ":");
         setCount(res.count);
+        pendingHit = res.key;
       } else {
         setState("tsc-err", "warn");
         chip.title = res.error;

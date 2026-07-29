@@ -2,13 +2,16 @@
 // node test.js
 const assert = require("assert");
 
-// minimal chrome.storage.local stub - must exist before background.js is required
+// minimal chrome.storage.local stub - must exist before background.js is required.
+// get() clones, exactly as the real API does: handing back a live reference would let
+// two racing readers share one object and quietly paper over lost-update bugs.
+const clone = v => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 global.chrome = {
   storage: {
     local: {
       _d: {},
-      async get(k) { return this._d[k] === undefined ? {} : { [k]: this._d[k] }; },
-      async set(o) { Object.assign(this._d, o); },
+      async get(k) { return this._d[k] === undefined ? {} : { [k]: clone(this._d[k]) }; },
+      async set(o) { Object.assign(this._d, clone(o)); },
       async remove(k) { delete this._d[k]; }
     }
   }
@@ -277,6 +280,144 @@ async function main() {
     global.fetch = () => { throw new Error("offline in tests"); };
     passed++;
     console.log("ok  (async) server condition filter falls back permanently on 400");
+  }
+
+  const page5 = () => Promise.resolve({ previousPage: "", nextPage: "", resultCount: 5,
+                                        totalResults: 5, data: MATCHING });
+
+  // 14 - two collects fired at once both land. The storage stub is deliberately slow
+  // on read: with an unserialized loadStore -> mutate -> saveStore, the second write
+  // is built on a snapshot taken before the first one landed and drops its row.
+  {
+    chrome.storage.local._d = {};
+    // The snapshot is taken when the read STARTS and delivered 8ms later - a slow read,
+    // not a late one. Two readers that overlap therefore see the same starting state.
+    const fast = chrome.storage.local.get;
+    chrome.storage.local.get = function (k) {
+      const snap = fast.call(this, k);
+      return new Promise(r => setTimeout(() => r(snap), 8)).then(() => snap);
+    };
+
+    const a = bg.collect({ productId: "1", sel: SEL, meta: META }, page5);
+    const b = bg.collect({ productId: "2", sel: SEL, meta: META }, page5);
+    const [ra, rb] = await Promise.all([a, b]);
+    assert.strictEqual(ra.ok && rb.ok, true);
+
+    const keys = (await bg.handle({ type: "list" })).rows.map(r => r.key);
+    assert.strictEqual(keys.length, 2, "both concurrent collects survived");
+    assert.deepStrictEqual(keys.slice().sort(),
+      ["1|Holofoil|Near Mint|English", "2|Holofoil|Near Mint|English"]);
+
+    // three more at once, on top of the two already stored
+    await Promise.all(["3", "4", "5"].map(id =>
+      bg.collect({ productId: id, sel: SEL, meta: META }, page5)));
+    assert.strictEqual((await bg.handle({ type: "count" })).count, 5, "no interleaved loss");
+
+    chrome.storage.local.get = fast;
+    passed++;
+    console.log("ok  (async) concurrent collects are serialized, no row lost");
+  }
+
+  // 15 - a plain re-add adds a copy; shift-click (mode anything else) does not
+  {
+    chrome.storage.local._d = {};
+    const msg = { productId: "489103", sel: SEL, meta: META };
+    const first = await bg.collect(Object.assign({ mode: "bump" }, msg), page5);
+    assert.strictEqual(first.qty, 1);
+    assert.strictEqual(first.mode, "added", "first add is not an increment");
+
+    const second = await bg.collect(Object.assign({ mode: "bump" }, msg), page5);
+    assert.strictEqual(second.mode, "incremented");
+    assert.strictEqual(second.qty, 2);
+    const third = await bg.collect(Object.assign({ mode: "bump" }, msg), page5);
+    assert.strictEqual(third.qty, 3);
+    assert.strictEqual((await bg.handle({ type: "count" })).count, 1, "still one row");
+
+    // refresh path leaves the count alone
+    const dearer = () => Promise.resolve({ previousPage: "", nextPage: "", resultCount: 5,
+      totalResults: 5, data: MATCHING.map(r => Object.assign({}, r, { purchasePrice: 20 })) });
+    const ref = await bg.collect(Object.assign({ mode: "refresh" }, msg), dearer);
+    assert.strictEqual(ref.mode, "refreshed");
+    assert.strictEqual(ref.qty, 3, "shift-click never changes the count");
+    const rows = (await bg.handle({ type: "list" })).rows;
+    assert.strictEqual(rows[0].avg_usd, "20.00", "price still re-pulled on the refresh path");
+    passed++;
+    console.log("ok  (async) re-add increments qty; refresh mode leaves it alone");
+  }
+
+  // 16 - refresh all re-prices every row while keeping qty and per-row % overrides
+  {
+    chrome.storage.local._d = {};
+    const a = await bg.collect({ productId: "1", sel: SEL, meta: META }, page5);
+    const jpSel = Object.assign({}, SEL, { language: "Japanese" });
+    const b = await bg.collect({ productId: "2", sel: jpSel, meta: META }, () =>
+      Promise.resolve({ previousPage: "", nextPage: "", resultCount: 5, totalResults: 5,
+        data: MATCHING.map(r => Object.assign({}, r, { language: "Japanese" })) }));
+
+    await bg.handle({ type: "setQty", key: a.key, qty: "7" });
+    await bg.handle({ type: "setQty", key: b.key, qty: "2" });
+    assert.strictEqual((await bg.handle({ type: "setPct", key: a.key, pct: "62.5" })).pct, 62.5);
+
+    // one page carrying both languages at the new price: each row must still pick out
+    // only the sales matching its own selection
+    const both = MATCHING.map(r => Object.assign({}, r, { purchasePrice: 20 }))
+      .concat(MATCHING.map(r => Object.assign({}, r, { purchasePrice: 20, language: "Japanese" })));
+    const res = await bg.handle({ type: "refreshAll" }, () =>
+      Promise.resolve({ previousPage: "", nextPage: "", resultCount: 10, totalResults: 10,
+        data: both }));
+    assert.strictEqual(res.refreshed, 2);
+    assert.strictEqual(res.failed, 0);
+    assert.strictEqual(res.count, 2, "refresh all never adds or drops a row");
+
+    const by = {};
+    for (const r of (await bg.handle({ type: "list" })).rows) by[r.key] = r;
+    assert.strictEqual(by[a.key].avg_usd, "20.00", "prices re-pulled");
+    assert.strictEqual(by[b.key].avg_usd, "20.00");
+    assert.strictEqual(by[a.key].qty, 7, "qty preserved");
+    assert.strictEqual(by[b.key].qty, 2);
+    assert.strictEqual(by[a.key]._pct, 62.5, "per-row % override preserved");
+    assert.strictEqual(by[b.key]._pct, undefined, "a row with no override stays without one");
+    assert.strictEqual(by[b.key]._language, "Japanese", "language survives the round trip");
+
+    // clearing an override drops the field rather than pinning today's global
+    await bg.handle({ type: "setPct", key: a.key, pct: "" });
+    assert.strictEqual((await bg.handle({ type: "list" })).rows
+      .find(r => r.key === a.key)._pct, undefined);
+    passed++;
+    console.log("ok  (async) refresh all re-prices every row, keeping qty and % overrides");
+  }
+
+  // 17 - drawer order is newest first by _addedAt, not lexicographic by key
+  {
+    chrome.storage.local._d = {};
+    const at = (key, iso) => ({ [key]: { name: key, _addedAt: iso, avg_usd: "1.00", cad: "" } });
+    await bg.handle({ type: "restore", store: Object.assign(
+      at("z|a", "2026-07-01T00:00:00.000Z"),
+      at("a|a", "2026-07-03T00:00:00.000Z"),
+      at("m|a", "2026-07-02T00:00:00.000Z")) });
+    assert.deepStrictEqual((await bg.handle({ type: "list" })).rows.map(r => r.key),
+      ["a|a", "m|a", "z|a"], "newest _addedAt first");
+
+    // a fresh collect is stamped now, so it goes to the top
+    const fresh = await bg.collect({ productId: "9", sel: SEL, meta: META }, page5);
+    assert.strictEqual((await bg.handle({ type: "list" })).rows[0].key, fresh.key,
+      "the row you just touched is the top row");
+
+    // undo restores the exact prior store
+    const before = (await bg.handle({ type: "list" })).rows.length;
+    const cleared = await bg.handle({ type: "clear" });
+    assert.strictEqual(cleared.cleared, before);
+    assert.strictEqual((await bg.handle({ type: "count" })).count, 0);
+    await bg.handle({ type: "restore", store: cleared.prev });
+    assert.strictEqual((await bg.handle({ type: "count" })).count, before, "undo puts it back");
+
+    const gone = await bg.handle({ type: "remove", key: fresh.key });
+    assert.strictEqual(gone.name, META.name, "remove reports what it removed");
+    await bg.handle({ type: "restore", store: gone.prev });
+    assert.strictEqual((await bg.handle({ type: "count" })).count, before,
+      "per-row undo puts it back too");
+    passed++;
+    console.log("ok  (async) rows sort newest first; clear and remove are undoable");
   }
 
   console.log(`\n${passed} assertion groups passed`);

@@ -18,6 +18,8 @@ const MAX_PAGES = 10;   // a rare condition on a busy product must not spin fore
 const SAMPLES = 5;
 const STALE_DAYS = 60;
 const STORE_KEY = "rows";
+const PCT_KEY = "pct";
+const DEFAULT_PCT = 100;
 
 // Exported columns. Everything else a stored row carries is underscore-prefixed and
 // stays out of the spreadsheet (sample count, staleness, FX rate, source URL, timestamp).
@@ -188,10 +190,46 @@ function saveStore(store) {
   return chrome.storage.local.set({ [STORE_KEY]: store });
 }
 
+// EVERY store mutation goes through here, and nothing else may call saveStore().
+//
+// Without this, two chips clicked a beat apart both run loadStore -> mutate -> saveStore
+// against the same snapshot and the second write drops the first one's row. The mutations
+// are queued on one promise chain, so each fn sees the store as the previous fn left it.
+// A rejecting fn must not wedge the chain, hence the swallowed catch on `queue`.
+let queue = Promise.resolve();
+
+function withStore(fn) {
+  const run = queue.then(async () => {
+    const store = await loadStore();
+    const out = await fn(store);
+    await saveStore(store);
+    return out;
+  });
+  queue = run.then(() => {}, () => {});
+  return run;
+}
+
+// Newest first. _addedAt is stamped on every write, so the row you just touched is the
+// row at the top of the drawer. Key order is the tiebreak for same-millisecond writes.
 function listRows(store) {
   return Object.keys(store)
-    .sort()
+    .sort((a, b) => {
+      const d = String(store[b]._addedAt || "").localeCompare(String(store[a]._addedAt || ""));
+      return d || a.localeCompare(b);
+    })
     .map(key => Object.assign({ key, qty: 1 }, store[key]));
+}
+
+async function getPct() {
+  const got = await chrome.storage.local.get(PCT_KEY);
+  const n = Number(got[PCT_KEY]);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_PCT;
+}
+
+function clampPct(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  return Math.min(1000, Math.max(0, Math.round(n * 10) / 10));
 }
 
 async function collect(msg, fetchPage) {
@@ -202,30 +240,72 @@ async function collect(msg, fetchPage) {
   }
 
   const row = buildRow(meta, sel, res.matched, await getFx());
-  const store = await loadStore();
   // Dedup key: productId + printing + condition + language. Re-adding OVERWRITES with
   // the fresh pull. Never silently skip - overwriting is how a stale entry gets
-  // refreshed. The qty you typed survives the refresh; only the price data is replaced.
+  // refreshed. Only the price data is replaced.
+  //
+  // mode "bump" (a plain click on an already-collected grade) also adds a copy;
+  // anything else - shift-click, refresh-all, an old caller that sends no mode -
+  // refreshes the price and leaves qty alone. Your per-row % override always survives.
   //
   // Language is part of the key because a product can sell in more than one: without it
   // a Japanese Holofoil NM pull silently overwrites the English one at the same grade.
   // It stays out of COLUMNS, so the exported spreadsheet is unchanged.
   const key = `${productId}|${row.printing}|${row.condition}|${row._language}`;
-  const prev = store[key];
-  if (prev && prev.qty) row.qty = prev.qty;
-  store[key] = Object.assign(row, { _addedAt: new Date().toISOString() });
-  await saveStore(store);
+
+  const out = await withStore(store => {
+    const prev = store[key];
+    let mode = "added";
+    if (prev) {
+      const q = Math.max(1, Math.round(Number(prev.qty) || 1));
+      if (msg.mode === "bump") { row.qty = q + 1; mode = "incremented"; }
+      else { row.qty = q; mode = "refreshed"; }
+      if (prev._pct !== undefined) row._pct = prev._pct;
+    }
+    store[key] = Object.assign(row, { _addedAt: new Date().toISOString() });
+    return { mode, qty: row.qty, count: Object.keys(store).length };
+  });
 
   return {
     ok: true,
     key,
+    mode: out.mode,
+    qty: out.qty,
     samples: row._samples,
     rejected: res.rejected,
     capped: res.capped,
     stale: row._stale,
     noFx: row.cad === "",
-    count: Object.keys(store).length
+    count: out.count
   };
+}
+
+// Re-pull every collected row at today's rate. Sequential on purpose: the sales API is
+// the bottleneck and a burst of parallel paging is how you get rate limited.
+async function refreshAll(fetchPage) {
+  const store = await loadStore();
+  const keys = Object.keys(store);
+  let refreshed = 0;
+  let failed = 0;
+
+  for (const key of keys) {
+    const row = store[key];
+    const productId = key.split("|")[0];
+    const sel = {
+      condition: row.condition,
+      variant: row.printing,
+      language: row._language || "English"
+    };
+    const meta = { name: row.name, set: row.set, number: row.number, url: row._url };
+    try {
+      const res = await collect({ productId, sel, meta, mode: "refresh" }, fetchPage);
+      if (res.ok) refreshed++; else failed++;
+    } catch (e) {
+      failed++;
+    }
+  }
+
+  return { ok: true, refreshed, failed, count: Object.keys(await loadStore()).length };
 }
 
 async function exportCsv() {
@@ -241,7 +321,7 @@ async function exportCsv() {
 
 // ---------------------------------------------------------------- messages
 
-async function handle(msg) {
+async function handle(msg, fetchPage) {
   switch (msg.type) {
     case "firstPage": {
       const page = await fetchSalesPage(msg.productId, 0);
@@ -255,24 +335,50 @@ async function handle(msg) {
       };
     }
     case "collect":
-      return collect(msg);
+      return collect(msg, fetchPage);
+    case "refreshAll":
+      return refreshAll(fetchPage);
     case "list": {
       const rows = listRows(await loadStore());
-      return { ok: true, rows, count: rows.length };
+      return { ok: true, rows, count: rows.length, pct: await getPct() };
     }
-    case "setQty": {
-      const store = await loadStore();
-      if (!store[msg.key]) return { ok: false, error: "gone" };
-      store[msg.key].qty = Math.max(1, Math.round(Number(msg.qty) || 1));
-      await saveStore(store);
-      return { ok: true, qty: store[msg.key].qty };
+    case "setQty":
+      return withStore(store => {
+        if (!store[msg.key]) return { ok: false, error: "gone" };
+        store[msg.key].qty = Math.max(1, Math.round(Number(msg.qty) || 1));
+        return { ok: true, qty: store[msg.key].qty };
+      });
+    // Per-row trade-in percent. An empty value clears the override and the row falls
+    // back to the global percent - that is the difference between "same as global"
+    // and "pinned at a number that happens to equal global today".
+    case "setPct":
+      return withStore(store => {
+        if (!store[msg.key]) return { ok: false, error: "gone" };
+        const pct = clampPct(msg.pct);
+        if (msg.pct === "" || msg.pct === null || pct === null) delete store[msg.key]._pct;
+        else store[msg.key]._pct = pct;
+        return { ok: true, pct: store[msg.key]._pct };
+      });
+    case "setGlobalPct": {
+      const pct = clampPct(msg.pct);
+      await chrome.storage.local.set({ [PCT_KEY]: pct === null ? DEFAULT_PCT : pct });
+      return { ok: true, pct: await getPct() };
     }
-    case "remove": {
-      const store = await loadStore();
-      delete store[msg.key];
-      await saveStore(store);
-      return { ok: true, count: Object.keys(store).length };
-    }
+    // Undo works by handing the drawer the whole prior store and taking it back
+    // verbatim. Restoring a diff would drift the moment a refresh lands in between.
+    case "remove":
+      return withStore(store => {
+        const prev = Object.assign({}, store);
+        const name = store[msg.key] && store[msg.key].name;
+        delete store[msg.key];
+        return { ok: true, prev, name, count: Object.keys(store).length };
+      });
+    case "restore":
+      return withStore(store => {
+        for (const k of Object.keys(store)) delete store[k];
+        Object.assign(store, msg.store || {});
+        return { ok: true, count: Object.keys(store).length };
+      });
     case "export":
       return exportCsv();
     case "copyText": {
@@ -281,8 +387,12 @@ async function handle(msg) {
       return { ok: true, text: toDelimited(rows, "\t"), count: rows.length };
     }
     case "clear":
-      await chrome.storage.local.remove(STORE_KEY);
-      return { ok: true, count: 0 };
+      return withStore(store => {
+        const prev = Object.assign({}, store);
+        const n = Object.keys(store).length;
+        for (const k of Object.keys(store)) delete store[k];
+        return { ok: true, prev, cleared: n, count: 0 };
+      });
     case "count":
       return { ok: true, count: Object.keys(await loadStore()).length };
   }
@@ -302,8 +412,8 @@ if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage)
 // node-runnable tests import the pure functions from here
 if (typeof module !== "undefined") {
   module.exports = {
-    COLUMNS, MAX_PAGES, PAGE_SIZE, SAMPLES, STALE_DAYS,
+    COLUMNS, MAX_PAGES, PAGE_SIZE, SAMPLES, STALE_DAYS, DEFAULT_PCT,
     matchesSelection, collectSales, buildRow, toDelimited, looksLoggedOut,
-    getFx, collect, handle, fetchSalesPage
+    getFx, collect, handle, fetchSalesPage, refreshAll, listRows, clampPct
   };
 }
