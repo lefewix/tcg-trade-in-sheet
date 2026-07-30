@@ -136,9 +136,13 @@ function keepMounted() {
     if (location.href !== href) { href = location.href; readUrl(); rebuild(); return; }
     if (!panel) return;
     if (!panel.isConnected) { mount(panel); }
-    // mounted on the document.body fallback, but the real anchor showed up late
-    else if (panel.parentElement === document.body &&
-             document.querySelector(".price-guide__points-header")) { mount(panel); }
+    // mounted on a fallback (body or the bare section), but the real anchor showed up
+    // late. "Properly mounted" has exactly one shape - immediately after the header -
+    // so anything else gets re-mounted the moment the header exists.
+    else {
+      const header = document.querySelector(".price-guide__points-header");
+      if (header && panel.previousElementSibling !== header) mount(panel);
+    }
     if (floatRoot && !floatRoot.isConnected) document.body.appendChild(floatRoot);
   };
   new MutationObserver(() => { if (!pending) pending = setTimeout(check, 250); })
@@ -165,7 +169,7 @@ function start() {
       if (msg && msg.type === "refreshProgress") refreshProgress(msg.done, msg.total);
     });
   }
-  init();
+  if (PID) init();
 }
 
 // ---------------------------------------------------------------- style
@@ -258,7 +262,9 @@ function style() {
     .tsc-alert.tsc-bad{background:var(--tsc-err-tint);border-color:var(--tsc-err-line);color:var(--tsc-err)}
 
     /* ---- floating collection ---- */
-    .tsc-root{position:fixed;right:18px;bottom:18px;z-index:2147483000;
+    /* bottom clears TCGplayer's circular support-chat bubble (~64px + margins),
+       which owns the bottom-right corner. The pill sits directly above it. */
+    .tsc-root{position:fixed;right:18px;bottom:96px;z-index:2147483000;
       font:13px/1.5 var(--tsc-sans);color:var(--tsc-ink);
       display:flex;flex-direction:column;align-items:flex-end;gap:10px}
     .tsc-pill{display:inline-flex;align-items:center;gap:9px;padding:9px 13px 9px 11px;
@@ -288,7 +294,8 @@ function style() {
     .tsc-undo:active{transform:translateY(1px)}
     @keyframes tsc-rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 
-    .tsc-drawer{width:min(470px,calc(100vw - 36px));max-height:min(66vh,600px);
+    .tsc-drawer{width:min(470px,calc(100vw - 36px));
+      max-height:min(calc(100vh - 120px),600px);
       display:none;flex-direction:column;background:var(--tsc-bg);
       border:1px solid var(--tsc-hair);border-radius:var(--tsc-r-box);
       box-shadow:0 16px 42px rgba(0,0,0,.5);overflow:hidden}
@@ -1233,14 +1240,24 @@ async function init() {
   panel.appendChild(noteBox);
   mount(panel);
 
-  let res;
-  try {
-    res = await send({ type: "firstPage", productId: PID });
-  } catch (e) {
-    alert_(body, "Could not reach the sales API: " + String(e.message || e), true);
+  // Two tries with a beat between them: the MV3 worker can be mid-wake on the first
+  // message, and the sales API drops the odd request. One silent retry turns "refresh
+  // the page until it loads" into a pause nobody notices. Only then is it an error.
+  let res, lastErr;
+  for (let attempt = 0; attempt < 2 && !res; attempt++) {
+    if (attempt) await new Promise(r => setTimeout(r, 1200));
+    try {
+      const r = await send({ type: "firstPage", productId: PID });
+      if (r.ok) res = r;
+      else lastErr = r.error;
+    } catch (e) {
+      lastErr = String((e && e.message) || e);
+    }
+  }
+  if (!res) {
+    alert_(body, "Could not read sales: " + lastErr, true);
     return;
   }
-  if (!res.ok) { alert_(body, "Could not read sales: " + res.error, true); return; }
   setCount(res.count);
 
   const groups = combos(res.rows);
@@ -1284,7 +1301,12 @@ if (typeof module !== "undefined" && module.exports) {
     LOW_SAMPLES, STALE_DAYS
   };
 } else {
-  // last: everything above uses `let` bindings that must be initialised first
+  // last: everything above uses `let` bindings that must be initialised first.
+  // start() runs on EVERY tcgplayer page, product or not: TCGplayer is a SPA, so a
+  // click from search to a product never reloads the page. When the script only
+  // injected on /product/* urls, that navigation left the panel missing until a
+  // manual refresh. The URL watcher inside keepMounted() is what builds the panel
+  // the moment the location becomes a product page.
   readUrl();
-  if (PID) start();
+  start();
 }
