@@ -284,7 +284,11 @@ function style() {
       max-width:min(436px,calc(100vw - 36px));
       background:var(--tsc-bg);border:1px solid var(--tsc-hair);border-radius:var(--tsc-r-ctl);
       box-shadow:var(--tsc-shadow);font-size:12px;color:var(--tsc-ink-2);
-      animation:tsc-rise .16s ease-out}
+      animation:tsc-rise .16s ease-out;
+      transition:opacity .18s ease,transform .18s ease}
+    /* exit mirrors the entry: same direction, slightly longer, so the toast reads as
+       sinking back where it came from instead of blinking off */
+    .tsc-toast.tsc-out{opacity:0;transform:translateY(6px)}
     .tsc-toast-t{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .tsc-undo{flex:none;border:1px solid var(--tsc-line);border-radius:var(--tsc-r-chip);
       background:var(--tsc-inp);color:var(--tsc-ac-ink);cursor:pointer;padding:5px 10px;
@@ -740,7 +744,7 @@ function undoToast(text, prev, keys) {
   t.appendChild(btn);
 
   floatRoot.insertBefore(t, floatRoot.firstChild);
-  toastTimer = setTimeout(() => dismissToast(t), 5000);
+  toastTimer = setTimeout(() => dismissToast(t), 3000);
 }
 
 // Same surface, no button: the outcome of an undo that could not do all of it.
@@ -751,13 +755,19 @@ function infoToast(text) {
   t.setAttribute("role", "status");
   t.appendChild(el("span", "tsc-toast-t", text));
   floatRoot.insertBefore(t, floatRoot.firstChild);
-  toastTimer = setTimeout(() => dismissToast(t), 4000);
+  toastTimer = setTimeout(() => dismissToast(t), 3000);
 }
 
 function dismissToast(t) {
   clearTimeout(toastTimer);
-  t.remove();
-  if (toastEl === t) toastEl = null;
+  // fade, then remove: the class transition runs .18s; the timeout gives it room.
+  // Under reduced motion the transition is disabled globally, so the class change is
+  // invisible and the removal lands a beat later - still correct, just not animated.
+  t.classList.add("tsc-out");
+  setTimeout(() => {
+    t.remove();
+    if (toastEl === t) toastEl = null;
+  }, 200);
 }
 
 // ---------------------------------------------------------------- print sheet
