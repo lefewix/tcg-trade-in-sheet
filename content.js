@@ -744,7 +744,7 @@ function undoToast(text, prev, keys) {
   t.appendChild(btn);
 
   floatRoot.insertBefore(t, floatRoot.firstChild);
-  toastTimer = setTimeout(() => dismissToast(t), 3000);
+  toastTimer = setTimeout(() => dismissToast(t), 5000);
 }
 
 // Same surface, no button: the outcome of an undo that could not do all of it.
