@@ -19,6 +19,7 @@ const STALE_DAYS = 60;
 const LOW_SAMPLES = 3;  // fewer than this and the price is one or two sales' opinion
 const STORE_KEY = "rows";
 const PCT_KEY = "pct";
+const SAVED_KEY = "saved";   // name -> { rows, at, count }: whole buylists, snapshotted
 const DEFAULT_PCT = 100;
 
 // Exported columns. Everything else a stored row carries is underscore-prefixed and
@@ -433,6 +434,25 @@ function withStore(fn) {
   return run;
 }
 
+// ---------------------------------------------------------------- saved buylists
+//
+// Snapshots, not references: a saved buylist is a deep copy of the rows as they were,
+// so collecting or clearing afterwards cannot reach back into it. Loading is also a
+// copy, so editing the loaded buylist does not silently rewrite the save.
+
+async function loadSaved() {
+  const got = await chrome.storage.local.get(SAVED_KEY);
+  return got[SAVED_KEY] || {};
+}
+
+function savedList(saved) {
+  return Object.keys(saved)
+    .sort((a, b) => String(saved[b].at || "").localeCompare(String(saved[a].at || "")))
+    .map(name => ({ name, count: saved[name].count || 0, at: saved[name].at || "" }));
+}
+
+const snapshot = obj => JSON.parse(JSON.stringify(obj));
+
 // Newest first. _addedAt is stamped on every write, so the row you just touched is the
 // row at the top of the drawer. Key order is the tiebreak for same-millisecond writes.
 function listRows(store) {
@@ -786,6 +806,49 @@ async function handle(msg, fetchPage) {
       });
     case "count":
       return { ok: true, count: Object.keys(await loadStore()).length };
+
+    // ---- saved buylists. Reads and writes of the CURRENT rows go through withStore
+    // so a save can never race a chip click; the saves map itself is only touched
+    // from inside those queued sections or standalone reads.
+    case "saveAs": {
+      const name = String(msg.name || "").trim().slice(0, 60);
+      if (!name) return { ok: false, error: "Name the buylist first" };
+      return withStore(async store => {
+        const count = Object.keys(store).length;
+        if (!count) return { ok: false, error: "Nothing to save" };
+        const saved = await loadSaved();
+        const replaced = !!saved[name];
+        saved[name] = { rows: snapshot(store), at: new Date().toISOString(), count };
+        await chrome.storage.local.set({ [SAVED_KEY]: saved });
+        return { ok: true, name, count, replaced, saves: savedList(saved) };
+      });
+    }
+    case "listSaved":
+      return { ok: true, saves: savedList(await loadSaved()) };
+    case "loadSaved":
+      return withStore(async store => {
+        const s = (await loadSaved())[msg.name];
+        if (!s) return { ok: false, error: "No such buylist" };
+        const prev = Object.assign({}, store);
+        for (const k of Object.keys(store)) delete store[k];
+        Object.assign(store, snapshot(s.rows));
+        return { ok: true, prev, name: msg.name, count: Object.keys(store).length };
+      });
+    // Wholesale replacement - the undo of loadSaved. Unlike "restore" it does not
+    // merge: undoing a load must bring back exactly the buylist that was showing.
+    case "replaceStore":
+      return withStore(store => {
+        for (const k of Object.keys(store)) delete store[k];
+        Object.assign(store, snapshot(msg.store || {}));
+        return { ok: true, count: Object.keys(store).length };
+      });
+    case "deleteSaved": {
+      const saved = await loadSaved();
+      if (!saved[msg.name]) return { ok: false, error: "No such buylist" };
+      delete saved[msg.name];
+      await chrome.storage.local.set({ [SAVED_KEY]: saved });
+      return { ok: true, saves: savedList(saved) };
+    }
   }
   throw new Error("unknown message: " + msg.type);
 }

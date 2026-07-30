@@ -40,7 +40,9 @@ const ICONS = {
           "M7.4 14.4h9.2V20H7.4Z"],
   trash: ["M4.6 6.9h14.8", "M10 10.9v6", "M14 10.9v6",
           "M6.7 6.9l.8 11.9a1.8 1.8 0 0 0 1.8 1.7h5.4a1.8 1.8 0 0 0 1.8-1.7l.8-11.9",
-          "M9.5 6.9V5a1.4 1.4 0 0 1 1.4-1.4h2.2A1.4 1.4 0 0 1 14.5 5v1.9"]
+          "M9.5 6.9V5a1.4 1.4 0 0 1 1.4-1.4h2.2A1.4 1.4 0 0 1 14.5 5v1.9"],
+  bookmark: ["M7 3.6h10a1.4 1.4 0 0 1 1.4 1.4v15.4L12 16.4 5.6 20.4V5A1.4 1.4 0 0 1 7 3.6Z"],
+  folder: ["M4 7a1.6 1.6 0 0 1 1.6-1.6h4.2l2 2.4h6.6A1.6 1.6 0 0 1 20 9.4v8A1.6 1.6 0 0 1 18.4 19H5.6A1.6 1.6 0 0 1 4 17.4Z"]
 };
 
 function icon(name, size) {
@@ -298,8 +300,8 @@ function style() {
     .tsc-undo:active{transform:translateY(1px)}
     @keyframes tsc-rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 
-    .tsc-drawer{width:min(470px,calc(100vw - 36px));
-      max-height:min(calc(100vh - 120px),600px);
+    .tsc-drawer{width:min(560px,calc(100vw - 36px));
+      max-height:min(calc(100vh - 120px),720px);
       display:none;flex-direction:column;background:var(--tsc-bg);
       border:1px solid var(--tsc-hair);border-radius:var(--tsc-r-box);
       box-shadow:0 16px 42px rgba(0,0,0,.5);overflow:hidden}
@@ -361,6 +363,21 @@ function style() {
        at a glance which lines are priced off the house rate */
     .tsc-pct[data-own="1"]{background:var(--tsc-ac-tint);border-color:var(--tsc-ac-line);
       color:var(--tsc-ac-ink)}
+
+    /* saved buylists: a second tools strip plus a fold-out list of snapshots */
+    .tsc-name{flex:1;min-width:0;padding:5px 8px;border:1px solid var(--tsc-line);
+      border-radius:var(--tsc-r-chip);background:var(--tsc-inp);color:var(--tsc-ink);
+      font:12px var(--tsc-sans);transition:border-color .15s ease}
+    .tsc-name:focus{border-color:var(--tsc-ac);outline:none}
+    .tsc-savelist{border-bottom:1px solid var(--tsc-hair);background:var(--tsc-sunk);
+      max-height:190px;overflow:auto}
+    .tsc-savelist[hidden]{display:none}
+    .tsc-saverow{display:flex;align-items:center;gap:9px;padding:8px 14px;font-size:12px}
+    .tsc-saverow + .tsc-saverow{border-top:1px solid var(--tsc-hair)}
+    .tsc-save-n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+      white-space:nowrap;font-weight:600;color:var(--tsc-ink)}
+    .tsc-save-m{font:10.5px var(--tsc-mono);color:var(--tsc-mut);white-space:nowrap}
+    .tsc-save-empty{padding:12px 14px;font-size:11.5px;color:var(--tsc-mut)}
 
     .tsc-list{overflow:auto;flex:1}
     .tsc-empty{display:flex;flex-direction:column;align-items:center;gap:10px;
@@ -469,6 +486,8 @@ const label = sel => `${sel.condition}, ${sel.variant}`;
 // ---------------------------------------------------------------- drawer
 
 let badge, drawer, listBox, sumBox, toolsBox, rateBox, printBtn, globalInput, pill;
+let savesBox, savesList, refreshSaves = () => {};
+let lastCount = 0;   // rows currently in the buylist; gates the Save as button
 let exportBtns = [];
 let globalPct = 100;
 let pctSet = false;      // has the house rate ever been chosen on this machine?
@@ -574,6 +593,8 @@ async function renderList() {
   }
   setCount(res.count);
   toolsBox.hidden = !res.rows.length;
+  lastCount = res.rows.length;
+  refreshSaves();
   renderRateBanner(res.rows.length);
   listBox.textContent = "";
   let hitRow = null;
@@ -585,7 +606,7 @@ async function renderList() {
     const empty = el("div", "tsc-empty");
     empty.appendChild(mark(34));
     const copy = el("div");
-    copy.appendChild(el("b", null, "Nothing collected yet"));
+    copy.appendChild(el("b", null, "Buylist is empty"));
     copy.appendChild(el("p", null,
       "Pick a grade on any product page and it lands here, priced and ready to export."));
     empty.appendChild(copy);
@@ -683,7 +704,7 @@ async function renderList() {
     const del = el("button", "tsc-del");
     del.type = "button";
     del.appendChild(icon("trash", 15));
-    del.title = "Remove from collection";
+    del.title = "Remove from buylist";
     del.setAttribute("aria-label", `Remove ${row.name}`);
     del.addEventListener("click", async () => {
       // Disabled for the round trip: a second click on an already-removed row is a
@@ -724,7 +745,9 @@ function undoOutcome(res) {
     + ` · ${res.kept} left as ${res.kept === 1 ? "it was" : "they were"}`;
 }
 
-function undoToast(text, prev, keys) {
+// `override` swaps the undo message: removals restore the deleted keys, but undoing a
+// buylist LOAD must put back exactly what was showing, so it replaces wholesale.
+function undoToast(text, prev, keys, override) {
   if (toastEl) toastEl.remove();
   clearTimeout(toastTimer);
 
@@ -736,7 +759,7 @@ function undoToast(text, prev, keys) {
   btn.type = "button";
   btn.addEventListener("click", async () => {
     dismissToast(t);
-    const res = await send({ type: "restore", store: prev, keys });
+    const res = await send(override || { type: "restore", store: prev, keys });
     renderList();
     const outcome = undoOutcome(res);
     if (outcome) infoToast(outcome);
@@ -937,15 +960,15 @@ function floatingUi() {
 
   drawer = el("div", "tsc-drawer");
   drawer.setAttribute("role", "dialog");
-  drawer.setAttribute("aria-label", "Collected cards");
+  drawer.setAttribute("aria-label", "Buylist");
 
   const head = el("div", "tsc-dhead");
   head.appendChild(mark(17));
-  head.appendChild(el("h2", null, "Collected cards"));
+  head.appendChild(el("h2", null, "Buylist"));
   const close = el("button", "tsc-x");
   close.type = "button";
   close.appendChild(icon("close", 16));
-  close.setAttribute("aria-label", "Close collection");
+  close.setAttribute("aria-label", "Close buylist");
   close.addEventListener("click", () => toggleDrawer(false));
   head.appendChild(close);
 
@@ -1056,6 +1079,134 @@ function floatingUi() {
 
   toolsBox.append(refreshBtn, printBtn);
 
+  // ---- saved buylists strip: name the current buylist and keep it, or bring one back.
+  // Saving is a snapshot; loading replaces the working buylist (with an Undo).
+  savesBox = el("div", "tsc-tools");
+  savesList = el("div", "tsc-savelist");
+  savesList.hidden = true;
+
+  const savesIdle = () => {
+    savesBox.textContent = "";
+    savesBox.appendChild(el("span", "tsc-tools-k", "Saved buylists"));
+    savesBox.appendChild(el("span", "tsc-gap"));
+    const saveBtn = el("button", "tsc-mini");
+    saveBtn.type = "button";
+    saveBtn.appendChild(icon("bookmark", 13));
+    saveBtn.appendChild(document.createTextNode("Save as"));
+    saveBtn.disabled = !lastCount;
+    saveBtn.title = lastCount
+      ? "Snapshot the current buylist under a name."
+      : "Collect something first.";
+    saveBtn.addEventListener("click", () => savesNaming());
+    const loadBtn = el("button", "tsc-mini");
+    loadBtn.type = "button";
+    loadBtn.appendChild(icon("folder", 13));
+    loadBtn.appendChild(document.createTextNode("Load"));
+    loadBtn.title = "Show saved buylists.";
+    loadBtn.setAttribute("aria-expanded", String(!savesList.hidden));
+    loadBtn.addEventListener("click", async () => {
+      savesList.hidden = !savesList.hidden;
+      loadBtn.setAttribute("aria-expanded", String(!savesList.hidden));
+      if (!savesList.hidden) renderSaves();
+    });
+    savesBox.append(saveBtn, loadBtn);
+  };
+
+  const savesNaming = () => {
+    savesBox.textContent = "";
+    const name = el("input", "tsc-name");
+    name.type = "text";
+    name.maxLength = 60;
+    name.value = `Buylist ${new Date().toLocaleDateString("en-CA")}`;
+    name.setAttribute("aria-label", "Name for this buylist");
+    const ok = el("button", "tsc-mini");
+    ok.type = "button";
+    ok.appendChild(icon("bookmark", 13));
+    ok.appendChild(document.createTextNode("Save"));
+    const cancel = el("button", "tsc-mini");
+    cancel.type = "button";
+    cancel.appendChild(icon("close", 13));
+    cancel.appendChild(document.createTextNode("Cancel"));
+    const commit = async () => {
+      const res = await send({ type: "saveAs", name: name.value });
+      if (!res.ok) { name.value = ""; name.placeholder = res.error; return; }
+      savesIdle();
+      renderSaves();
+      infoToast(res.replaced
+        ? `Replaced "${res.name}" (${res.count} card${res.count === 1 ? "" : "s"})`
+        : `Saved "${res.name}" (${res.count} card${res.count === 1 ? "" : "s"})`);
+    };
+    ok.addEventListener("click", commit);
+    name.addEventListener("keydown", e => {
+      if (e.key === "Enter") commit();
+      // swallow it: Escape here backs out of naming, not out of the whole drawer
+      if (e.key === "Escape") { e.stopPropagation(); savesIdle(); }
+    });
+    cancel.addEventListener("click", () => savesIdle());
+    savesBox.append(name, ok, cancel);
+    name.focus();
+    name.select();
+  };
+
+  const renderSaves = async () => {
+    const res = await send({ type: "listSaved" });
+    if (!res.ok) return;
+    savesList.textContent = "";
+    if (!res.saves.length) {
+      savesList.appendChild(el("div", "tsc-save-empty",
+        "No saved buylists yet. Save as keeps the current one under a name."));
+      return;
+    }
+    for (const s of res.saves) {
+      const row = el("div", "tsc-saverow");
+      row.appendChild(el("span", "tsc-save-n", s.name));
+      row.appendChild(el("span", "tsc-save-m",
+        `${s.count} card${s.count === 1 ? "" : "s"} · ${String(s.at).slice(0, 10)}`));
+      const load = el("button", "tsc-mini");
+      load.type = "button";
+      load.appendChild(icon("folder", 13));
+      load.appendChild(document.createTextNode("Load"));
+      load.title = "Replace the current buylist with this one. Undo brings the current one back.";
+      load.addEventListener("click", async () => {
+        const r = await send({ type: "loadSaved", name: s.name });
+        if (!r.ok) { infoToast(r.error); return; }
+        savesList.hidden = true;
+        renderList();
+        undoToast(`Loaded "${r.name}"`, null, null, { type: "replaceStore", store: r.prev });
+      });
+      const del = el("button", "tsc-del");
+      del.type = "button";
+      del.appendChild(icon("trash", 14));
+      del.title = `Delete the saved buylist "${s.name}"`;
+      del.setAttribute("aria-label", `Delete saved buylist ${s.name}`);
+      // same two-step arming as Clear: first click asks, second click deletes
+      del.addEventListener("click", async () => {
+        if (del.dataset.armed !== "1") {
+          del.dataset.armed = "1";
+          del.textContent = "Delete?";
+          setTimeout(() => {
+            if (del.dataset.armed !== "1" || !del.isConnected) return;
+            del.dataset.armed = "0";
+            del.textContent = "";
+            del.appendChild(icon("trash", 14));
+          }, 2500);
+          return;
+        }
+        const r = await send({ type: "deleteSaved", name: s.name });
+        if (r.ok) renderSaves();
+      });
+      row.append(load, del);
+      savesList.appendChild(row);
+    }
+  };
+  savesIdle();
+  refreshSaves = () => {
+    // never rebuild the strip out from under a half-typed name
+    if (savesBox.querySelector(".tsc-name")) return;
+    savesIdle();
+    if (!savesList.hidden) renderSaves();
+  };
+
   listBox = el("div", "tsc-list");
 
   const foot = el("div", "tsc-foot");
@@ -1080,7 +1231,7 @@ function floatingUi() {
   });
 
   const clearBtn = actionButton("tsc-b tsc-danger", "trash", "Clear");
-  clearBtn.setAttribute("aria-label", "Clear the whole collection");
+  clearBtn.setAttribute("aria-label", "Clear the whole buylist");
   clearBtn.addEventListener("click", async () => {
     if (clearBtn.dataset.armed !== "1") {
       clearBtn.dataset.armed = "1";
@@ -1108,13 +1259,13 @@ function floatingUi() {
 
   exportBtns = [copyBtn, csvBtn, clearBtn];
   foot.append(copyBtn, csvBtn, clearBtn);
-  drawer.append(head, sumBox, rateBox, toolsBox, listBox, foot);
+  drawer.append(head, sumBox, rateBox, toolsBox, savesBox, savesList, listBox, foot);
 
   pill = el("button", "tsc-pill");
   pill.type = "button";
   pill.setAttribute("aria-expanded", "false");
   pill.appendChild(mark(16));
-  pill.appendChild(document.createTextNode("Collected"));
+  pill.appendChild(document.createTextNode("Buylist"));
   badge = el("span", "tsc-badge", "0");
   badge.dataset.zero = "1";
   pill.appendChild(badge);
