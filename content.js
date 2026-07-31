@@ -158,8 +158,14 @@ function rebuild() {
   if (PID) init();
 }
 
-// Set by floatingUi; the worker streams refresh progress and this is where it lands.
+// Set by floatingUi; the worker streams refresh progress/completion and the persisted
+// status record, and these are where they land.
 let refreshProgress = () => {};
+let refreshDone = () => {};
+let updateStatus = () => {};
+// Pulls the persisted record on demand - a drawer opened after the run started, or
+// after the worker that was running it died.
+let refreshStatus = () => {};
 
 function start() {
   href = location.href;
@@ -168,7 +174,24 @@ function start() {
   keepMounted();
   if (chrome.runtime && chrome.runtime.onMessage) {
     chrome.runtime.onMessage.addListener(msg => {
-      if (msg && msg.type === "refreshProgress") refreshProgress(msg.done, msg.total);
+      if (!msg) return;
+      if (msg.type === "refreshProgress") refreshProgress(msg.runId, msg.done, msg.total);
+      if (msg.type === "refreshDone") refreshDone(msg.runId, msg.result);
+    });
+  }
+  // Another tab collecting, deleting or re-rating changes the same store this tab shows.
+  // Without this, its badge and an open drawer sat stale until the next click here.
+  if (chrome.storage && chrome.storage.onChanged) {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local") return;
+      if (changes.refreshRun) {
+        const rec = changes.refreshRun.newValue;
+        updateStatus(rec, !!rec && !rec.finished);
+      }
+      if (changes.rows || changes.pct) {
+        if (changes.rows) setCount(Object.keys(changes.rows.newValue || {}).length);
+        if (drawer && drawer.classList.contains("tsc-open")) renderList();
+      }
     });
   }
   if (PID) init();
@@ -256,6 +279,11 @@ function style() {
     .tsc-skel:nth-child(3){width:88px;animation-delay:.3s}
     @keyframes tsc-fade{0%,100%{opacity:.55}50%{opacity:1}}
 
+    /* the shift-click affordance, stated where the chips are rather than hidden in a
+       title attribute nobody hovers */
+    .tsc-hint{margin:2px 0 0;font-size:11px;color:var(--tsc-mut)}
+    .tsc-hint b{font-weight:600;color:var(--tsc-ink-2)}
+
     .tsc-note{margin:12px 0 0;font-size:11.5px;color:var(--tsc-mut);min-height:1em}
     .tsc-note b{font-weight:600;color:var(--tsc-ink-2)}
     .tsc-alert{margin:2px 0 0;padding:10px 12px;border-radius:var(--tsc-r-ctl);
@@ -305,12 +333,19 @@ function style() {
       display:none;flex-direction:column;background:var(--tsc-bg);
       border:1px solid var(--tsc-hair);border-radius:var(--tsc-r-box);
       box-shadow:0 16px 42px rgba(0,0,0,.5);overflow:hidden}
-    .tsc-drawer.tsc-open{display:flex}
+    /* entrance mirrors the toast's tsc-rise: ~160ms ease-out translate+fade. The exit
+       runs the same move in reverse via .tsc-out before display goes back to none.
+       Both are killed wholesale by the reduced-motion block below. */
+    .tsc-drawer.tsc-open{display:flex;animation:tsc-rise .16s ease-out}
+    .tsc-drawer.tsc-open.tsc-out{opacity:0;transform:translateY(6px);pointer-events:none;
+      transition:opacity .16s ease-out,transform .16s ease-out}
     .tsc-dhead{display:flex;align-items:center;gap:9px;padding:12px 12px 12px 14px;
       border-bottom:1px solid var(--tsc-hair)}
     .tsc-dhead h2{flex:1;margin:0;font-size:13px;font-weight:700;letter-spacing:-.02em;
       color:var(--tsc-ink)}
-    .tsc-x{display:inline-flex;border:0;background:none;cursor:pointer;color:var(--tsc-mut);
+    /* icon-only buttons: at least 28px square, or the click target is the icon alone */
+    .tsc-x{display:inline-flex;align-items:center;justify-content:center;min-width:28px;
+      min-height:28px;border:0;background:none;cursor:pointer;color:var(--tsc-mut);
       padding:4px;border-radius:6px;transition:background .15s ease,color .15s ease}
     .tsc-x:hover{background:var(--tsc-row);color:var(--tsc-ink)}
 
@@ -332,8 +367,8 @@ function style() {
     .tsc-rate b{font-weight:700}
 
     /* tools strip: the two settings-ish actions, kept out of the primary footer */
-    .tsc-tools{display:flex;align-items:center;gap:7px;padding:9px 12px 9px 14px;
-      border-bottom:1px solid var(--tsc-hair)}
+    .tsc-tools{display:flex;flex-wrap:wrap;align-items:center;gap:7px;
+      padding:9px 12px 9px 14px;border-bottom:1px solid var(--tsc-hair)}
     .tsc-tools[hidden]{display:none}
     .tsc-tools-k{font-size:11px;font-weight:500;letter-spacing:.01em;color:var(--tsc-mut)}
     .tsc-gap{flex:1}
@@ -363,6 +398,17 @@ function style() {
        at a glance which lines are priced off the house rate */
     .tsc-pct[data-own="1"]{background:var(--tsc-ac-tint);border-color:var(--tsc-ac-line);
       color:var(--tsc-ac-ink)}
+    /* above 100% you are paying MORE than market - legal, occasionally deliberate,
+       always worth a second look, so the box turns warning-coloured */
+    .tsc-pct[data-warn="1"]{background:var(--tsc-warn-tint);border-color:var(--tsc-warn-line);
+      color:var(--tsc-warn)}
+
+    /* persistent status row: where the last refresh's outcome lives after the button
+       label has gone back to resting */
+    .tsc-status{padding:8px 14px;border-bottom:1px solid var(--tsc-hair);
+      font-size:11px;line-height:1.45;color:var(--tsc-mut)}
+    .tsc-status[hidden]{display:none}
+    .tsc-status.tsc-warn-t{color:var(--tsc-warn)}
 
     /* saved buylists: a second tools strip plus a fold-out list of snapshots */
     .tsc-name{flex:1;min-width:0;padding:5px 8px;border:1px solid var(--tsc-line);
@@ -376,7 +422,10 @@ function style() {
     .tsc-saverow + .tsc-saverow{border-top:1px solid var(--tsc-hair)}
     .tsc-save-n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
       white-space:nowrap;font-weight:600;color:var(--tsc-ink)}
-    .tsc-save-m{font:10.5px var(--tsc-mono);color:var(--tsc-mut);white-space:nowrap}
+    .tsc-save-m{font:11px var(--tsc-mono);color:var(--tsc-mut);white-space:nowrap}
+    /* a save that failed says so in a visible line, not a placeholder that vanishes
+       the moment you type */
+    .tsc-form-err{flex-basis:100%;font-size:11px;font-weight:500;color:var(--tsc-err)}
     .tsc-save-empty{padding:12px 14px;font-size:11.5px;color:var(--tsc-mut)}
 
     .tsc-list{overflow:auto;flex:1}
@@ -405,7 +454,7 @@ function style() {
     .tsc-s>.tsc-keep{flex:none;overflow:visible;font-family:var(--tsc-mono)}
     .tsc-flag{flex:none;display:inline-flex;align-items:center;gap:3px;padding:1px 5px 1px 4px;
       border-radius:6px;background:var(--tsc-warn-tint);border:1px solid var(--tsc-warn-line);
-      color:var(--tsc-warn);font:10.5px/1.5 var(--tsc-mono);font-weight:600}
+      color:var(--tsc-warn);font:11px/1.5 var(--tsc-mono);font-weight:600}
     .tsc-flag-bad{background:var(--tsc-err-tint);border-color:var(--tsc-err-line);
       color:var(--tsc-err)}
     .tsc-p{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
@@ -419,7 +468,8 @@ function style() {
       transition:border-color .15s ease}
     .tsc-q:hover{border-color:var(--tsc-hair-h)}
     .tsc-q:focus{border-color:var(--tsc-ac)}
-    .tsc-del{display:inline-flex;border:0;background:none;cursor:pointer;
+    .tsc-del{display:inline-flex;align-items:center;justify-content:center;min-width:28px;
+      min-height:28px;border:0;background:none;cursor:pointer;
       color:var(--tsc-mut);padding:4px;border-radius:6px;
       transition:background .15s ease,color .15s ease}
     .tsc-del:hover{background:var(--tsc-err-tint);color:var(--tsc-err)}
@@ -486,6 +536,8 @@ const label = sel => `${sel.condition}, ${sel.variant}`;
 // ---------------------------------------------------------------- drawer
 
 let badge, drawer, listBox, sumBox, toolsBox, rateBox, printBtn, globalInput, pill;
+let statusBox, drawerClose;
+let closeTimer = 0;      // pending drawer-close animation; cleared by a reopen
 let savesBox, savesList, refreshSaves = () => {};
 let lastCount = 0;   // rows currently in the buylist; gates the Save as button
 let exportBtns = [];
@@ -527,6 +579,24 @@ const tradeCad = row => tradeUnit(row, globalPct);
 const tradeTotal = row => tradeLine(row, globalPct);
 
 const lowSamples = row => Number(row._samples) > 0 && Number(row._samples) < LOW_SAMPLES;
+
+// The worker clamps to 0-1000 and that clamp stays where it is: it is the only one that
+// binds, because a number input's max is advisory in every browser that ships one. What
+// the attribute buys is the spinner and the arrow keys refusing to walk past it. Anything
+// over 100 is still allowed - a shop occasionally pays over market on purpose - but it is
+// paying MORE than the card is worth, so the box says so in warning colours.
+const MAX_PCT = 1000;
+function markOverPct(input) {
+  const n = Number(input.value);
+  const over = Number.isFinite(n) && n > 100;
+  input.dataset.warn = over ? "1" : "0";
+  // the resting tooltip is remembered once, so dropping back under 100 restores it
+  // instead of leaving the warning behind on a perfectly ordinary rate
+  if (input.dataset.tip === undefined) input.dataset.tip = input.title || "";
+  input.title = over
+    ? `${n}% pays MORE than market value. That is allowed, but check it is what you meant.`
+    : input.dataset.tip;
+}
 
 function setCount(n) {
   if (!badge) return;
@@ -590,6 +660,7 @@ async function renderList() {
   pctSet = !!res.pctSet;
   if (globalInput && document.activeElement !== globalInput) {
     globalInput.value = String(globalPct);
+    markOverPct(globalInput);
   }
   setCount(res.count);
   toolsBox.hidden = !res.rows.length;
@@ -621,9 +692,13 @@ async function renderList() {
 
     const text = el("div", "tsc-t");
     const name = el("a", "tsc-n", row.name);
-    name.href = row._url || "#";
-    name.target = "_blank";
-    name.rel = "noreferrer";
+    // no href at all when the source URL is missing: an href="#" link scrolls the page
+    // to nowhere and lies to assistive tech about being navigable
+    if (row._url) {
+      name.href = row._url;
+      name.target = "_blank";
+      name.rel = "noreferrer";
+    }
     const sub = el("div", "tsc-s");
     sub.appendChild(el("span", null, `${row.printing} · ${row.condition}`));
     if (row._language && row._language !== "English") {
@@ -649,6 +724,16 @@ async function renderList() {
       bad.title = "The last Refresh prices run could not re-pull this row. "
         + "Its price is whatever it was before.";
       sub.appendChild(bad);
+    }
+    // The set/number heuristics on the product page failed for this row. Same surface
+    // as the other trust flags: a wrong set on a customer-facing sheet is a dispute.
+    if (row._meta_warn) {
+      const guess = el("span", "tsc-flag");
+      guess.appendChild(icon("warn", 11));
+      guess.appendChild(document.createTextNode("check set/no."));
+      guess.title = "The set or card number could not be read cleanly from the product "
+        + "page. Check both before this row goes on a customer-facing sheet.";
+      sub.appendChild(guess);
     }
     if (row._stale) {
       const flag = el("span", "tsc-flag");
@@ -679,11 +764,14 @@ async function renderList() {
     const pct = el("input", "tsc-pct");
     pct.type = "number";
     pct.min = "0";
+    pct.max = String(MAX_PCT);
     pct.step = "1";
     pct.value = String(rowPct(row));
     pct.dataset.own = row._pct === undefined || row._pct === null ? "0" : "1";
     pct.setAttribute("aria-label", `Trade-in percent for ${row.name}`);
     pct.title = "Trade-in percent for this row. Clear it to follow the rate above.";
+    markOverPct(pct);
+    pct.addEventListener("input", () => markOverPct(pct));
     pct.addEventListener("change", async () => {
       const res2 = await send({ type: "setPct", key: row.key, pct: pct.value.trim() });
       if (res2.ok) { pendingHit = row.key; renderList(); }
@@ -886,7 +974,7 @@ function printDoc(rows, housePct) {
   h1{margin:0;font-size:17px;font-weight:700;letter-spacing:-.02em}
   .date{font-size:11.5px;color:var(--mut)}
   table{width:100%;border-collapse:collapse}
-  th{text-align:left;font-size:10.5px;font-weight:600;letter-spacing:.04em;color:var(--mut);
+  th{text-align:left;font-size:11px;font-weight:600;letter-spacing:.04em;color:var(--mut);
     padding:0 8px 7px;border-bottom:1px solid var(--line)}
   td{padding:8px;border-bottom:1px solid var(--line);vertical-align:top}
   td:first-child{font-weight:600}
@@ -919,12 +1007,32 @@ async function openPrintSheet() {
   if (!res.pctSet) return "set the rate first";
   globalPct = res.pct;
   pctSet = true;
-  const w = window.open("", "_blank");
-  if (!w) return "popup blocked";
-  w.document.open();
-  w.document.write(printDoc(res.rows, res.pct));
-  w.document.close();
-  setTimeout(() => { try { w.focus(); w.print(); } catch (e) { /* user can print manually */ } }, 200);
+  // A Blob URL, not document.write: writing into an open document leaves the new window
+  // with no real load event to wait on, which is why printing used to fire on a guessed
+  // 200ms timer and could catch the sheet mid-parse - a customer-facing document printed
+  // without its own stylesheet. A blob is a genuine navigation, so `load` means loaded.
+  const url = URL.createObjectURL(
+    new Blob([printDoc(res.rows, res.pct)], { type: "text/html;charset=utf-8" }));
+  const w = window.open(url, "_blank");
+  if (!w) { URL.revokeObjectURL(url); return "popup blocked"; }
+
+  let fired = false;
+  const fire = () => {
+    if (fired) return;
+    fired = true;
+    try { w.focus(); w.print(); } catch (e) { /* user can still print manually */ }
+    // revoke only after the print dialog has the document; doing it any earlier can
+    // pull the URL out from under a window still fetching it
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  };
+  try {
+    if (w.document && w.document.readyState === "complete") fire();
+    else w.addEventListener("load", fire, { once: true });
+  } catch (e) {
+    // the popup blocker handed back a window we cannot touch: fall back to the old
+    // guess rather than never printing at all
+    setTimeout(fire, 400);
+  }
   return null;
 }
 
@@ -965,7 +1073,7 @@ function floatingUi() {
   const head = el("div", "tsc-dhead");
   head.appendChild(mark(17));
   head.appendChild(el("h2", null, "Buylist"));
-  const close = el("button", "tsc-x");
+  const close = drawerClose = el("button", "tsc-x");
   close.type = "button";
   close.appendChild(icon("close", 16));
   close.setAttribute("aria-label", "Close buylist");
@@ -976,6 +1084,14 @@ function floatingUi() {
   rateBox = el("div", "tsc-rate");
   rateBox.hidden = true;
 
+  // Where a refresh says what it did, and keeps saying it. role=status so a screen
+  // reader hears the outcome without the user hunting for a button label that has
+  // already reverted.
+  statusBox = el("div", "tsc-status");
+  statusBox.hidden = true;
+  statusBox.setAttribute("role", "status");
+  statusBox.setAttribute("aria-live", "polite");
+
   // ---- tools strip: house rate, refresh all, print
   toolsBox = el("div", "tsc-tools");
   toolsBox.hidden = true;
@@ -983,16 +1099,20 @@ function floatingUi() {
   globalInput = el("input", "tsc-pct");
   globalInput.type = "number";
   globalInput.min = "0";
+  globalInput.max = String(MAX_PCT);
   globalInput.step = "1";
   globalInput.value = String(globalPct);
   globalInput.setAttribute("aria-label", "Trade-in percent for every row without its own");
   globalInput.title = "Applies to every row that has no percent of its own.";
+  markOverPct(globalInput);
+  globalInput.addEventListener("input", () => markOverPct(globalInput));
   globalInput.addEventListener("change", async () => {
     const res = await send({ type: "setGlobalPct", pct: globalInput.value.trim() });
     if (!res.ok) return;
     // Blanking the box is refused by the worker, so put the live rate back rather than
     // leaving an empty field that disagrees with what every row is priced at.
     globalInput.value = String(res.pct);
+    markOverPct(globalInput);
     pctSet = !!res.pctSet;
     renderList();
   });
@@ -1005,63 +1125,176 @@ function floatingUi() {
   refreshBtn.appendChild(document.createTextNode("Refresh prices"));
   refreshBtn.title = "Re-pull every collected row at today's rate.";
   const REFRESH_LABEL = "Refresh prices";
+  const REFRESH_TIP = "Re-pull every collected row at today's rate.";
   let refreshRevert = 0;
-  let refreshing = false;
+  let liveRun = null;   // id of the run this drawer believes is in flight, or null
 
-  // A 50-row collection is 50 sequential paging runs. The worker streams its position
-  // and the button doubles as the way out, so the run is never a frozen label with no
-  // end in sight and no way to stop it.
-  refreshProgress = (done, total) => {
-    if (!refreshing) return;
-    miniLabel(refreshBtn, "close", `Cancel (${done}/${total})`);
+  // The drawer NEVER learns the outcome from the sendMessage response any more. An MV3
+  // service worker can be torn down mid-run, and a 50-row refresh is 50 sequential paging
+  // runs - long enough that the response callback frequently died with it, at which point
+  // 40 successful rows were reported as "Refresh failed" and the failedKeys, the entire
+  // point of the run, went with it. The worker answers { started: true } straight away and
+  // writes a record per row; this side is driven by the broadcasts and, when the broadcast
+  // never arrives, by that persisted record. Partial success reads as partial success.
+  const setBusyLabel = (done, total) => {
+    miniLabel(refreshBtn, "close",
+      total ? `Cancel (${done}/${total})` : "Cancel");
+    refreshBtn.title = "Stop the refresh. Rows already done keep their new prices.";
+    refreshBtn.setAttribute("aria-busy", "true");
+  };
+
+  const restLabel = () => {
+    refreshBtn.removeAttribute("aria-busy");
+    miniLabel(refreshBtn, "refresh", REFRESH_LABEL);
+    refreshBtn.title = REFRESH_TIP;
+  };
+
+  // One sentence for a finished run, built from the persisted record so it says the same
+  // thing whether it came from a broadcast, a reopened drawer or another tab entirely.
+  const outcomeOf = rec => {
+    if (!rec) return null;
+    if (rec.cancelled) {
+      const left = Math.max(0, (rec.total || 0) - (rec.done || 0));
+      return { text: `Stopped after ${rec.refreshed} row${rec.refreshed === 1 ? "" : "s"}`
+        + (left ? `, ${left} left` : ""), warn: true };
+    }
+    // Died mid-run: the record was never marked finished and nothing is running now.
+    if (!rec.finished) {
+      return { text: `Interrupted after ${rec.refreshed} of ${rec.total} row`
+        + `${rec.total === 1 ? "" : "s"}. Those ${rec.refreshed} kept their new prices; `
+        + "run it again to finish the rest.", warn: true };
+    }
+    if (rec.failed) {
+      return { text: `${rec.refreshed} refreshed, ${rec.failed} could not be re-pulled `
+        + "and are flagged in the list below.", warn: true };
+    }
+    if (rec.fxFailed) {
+      return { text: `${rec.refreshed} refreshed, but the exchange-rate lookup failed - `
+        + "CAD figures are on the previous rate.", warn: true };
+    }
+    if (rec.skipped) {
+      return { text: `${rec.refreshed} refreshed, ${rec.skipped} row`
+        + `${rec.skipped === 1 ? " was" : "s were"} removed from TCGplayer.`, warn: true };
+    }
+    return { text: `Refreshed ${rec.refreshed} row${rec.refreshed === 1 ? "" : "s"} at `
+      + "today's prices and rate.", warn: false };
+  };
+
+  // The status row outlives the button label. A refresh outcome that lived only in a
+  // 4-second button label was gone before the user had finished reading the list it
+  // was describing.
+  const showStatus = (rec, running) => {
+    if (!statusBox) return;
+    if (!rec) { statusBox.hidden = true; statusBox.textContent = ""; return; }
+    if (running) {
+      statusBox.hidden = false;
+      statusBox.classList.remove("tsc-warn-t");
+      statusBox.textContent =
+        `Refreshing prices: ${rec.done} of ${rec.total} done. Click Cancel to stop.`;
+      return;
+    }
+    const out = outcomeOf(rec);
+    if (!out) { statusBox.hidden = true; return; }
+    statusBox.hidden = false;
+    statusBox.classList.toggle("tsc-warn-t", out.warn);
+    statusBox.textContent = `Last refresh · ${out.text}`;
+  };
+
+  // Adopt a record: flags, list, button and status row all follow from it.
+  const adopt = (rec, running) => {
+    if (!rec) return;
+    failedKeys = new Set(rec.failedKeys || []);
+    if (running) {
+      liveRun = rec.id;
+      setBusyLabel(rec.done, rec.total);
+      showStatus(rec, true);
+      note(`Refreshing prices: ${rec.done} of ${rec.total} done. Click Cancel to stop.`);
+      return;
+    }
+    liveRun = null;
+    clearTimeout(refreshRevert);
+    const out = outcomeOf(rec);
+    showStatus(rec, false);
+    if (out) {
+      note(out.text);
+      miniLabel(refreshBtn, "refresh",
+        rec.cancelled ? "Stopped" : out.warn ? "Partly done" : "Refreshed");
+      refreshBtn.removeAttribute("aria-busy");
+      // The label always finds its way home; the status row keeps the detail.
+      refreshRevert = setTimeout(restLabel, 4000);
+    } else {
+      restLabel();
+    }
+    renderList();
+  };
+
+  // Ask the worker where the latest run stands. Called on every drawer open, so a drawer
+  // opened after the worker died still shows what that run managed to do.
+  refreshStatus = async () => {
+    try {
+      const res = await send({ type: "refreshStatus" });
+      if (res && res.ok && res.record) adopt(res.record, !!res.running);
+    } catch (e) { /* worker asleep; the next broadcast or open will do it */ }
+  };
+
+  // Streamed position, per row. runId-gated: a broadcast from a run this drawer did not
+  // start (or from one already finished) must not repaint a live label.
+  refreshProgress = (runId, done, total) => {
+    if (liveRun && runId !== liveRun) return;
+    liveRun = runId;
+    setBusyLabel(done, total);
+    showStatus({ done, total }, true);
     note(`Refreshing prices: ${done} of ${total} done. Click Cancel to stop.`);
   };
 
+  refreshDone = (runId, result) => {
+    if (liveRun && runId !== liveRun) return;
+    adopt(Object.assign({ id: runId, finished: true }, result), false);
+  };
+
+  // chrome.storage.onChanged, i.e. a run started in ANOTHER tab. Same treatment: this
+  // drawer shows the same store, so it shows the same run.
+  updateStatus = (rec, running) => {
+    if (!statusBox) return;
+    if (liveRun && rec && rec.id !== liveRun) return;
+    adopt(rec, running);
+  };
+
   refreshBtn.addEventListener("click", async () => {
-    if (refreshing) { send({ type: "cancelRefresh" }); return; }
+    if (liveRun) { send({ type: "cancelRefresh", runId: liveRun }); return; }
 
     clearTimeout(refreshRevert);
-    refreshing = true;
     failedKeys = new Set();
-    refreshBtn.setAttribute("aria-busy", "true");
-    refreshBtn.title = "Stop the refresh. Rows already done keep their new prices.";
-    miniLabel(refreshBtn, "refresh", "Refreshing");
+    setBusyLabel(0, 0);
+    note("Refreshing prices.");
 
     let res;
     try {
       res = await send({ type: "refreshAll" });
     } catch (e) {
-      res = { ok: false };
+      res = null;
     }
-    refreshing = false;
-    refreshBtn.removeAttribute("aria-busy");
-    if (res && res.ok && res.failedKeys) failedKeys = new Set(res.failedKeys);
-
-    // An FX outage is a partial failure, not a success: the prices moved but the rate
-    // did not, so every CAD figure is yesterday's. Say so instead of reporting "done".
-    let outcome = null;
-    if (!res || !res.ok) outcome = "Refresh failed";
-    else if (res.cancelled) outcome = `Stopped, ${res.remaining} left`;
-    else if (res.failed) outcome = `${res.refreshed} done, ${res.failed} failed`;
-    else if (res.fxFailed) outcome = `${res.refreshed} done, rate unavailable`;
-    else if (res.skipped) outcome = `${res.refreshed} done, ${res.skipped} removed`;
-
-    miniLabel(refreshBtn, "refresh", outcome || REFRESH_LABEL);
-    refreshBtn.title = outcome && res && res.fxFailed
-      ? "The exchange-rate lookup failed. Rows kept their last known rate."
-      : "Re-pull every collected row at today's rate.";
-    // Which rows failed, named in the drawer rather than left as a count to hunt for.
-    note(res && res.ok
-      ? (outcome || `Refreshed ${res.refreshed} row${res.refreshed === 1 ? "" : "s"}.`)
-        + (failedKeys.size ? " The rows it could not re-pull are flagged in the drawer."
-          : "")
-      : "Refresh failed.");
-    // The label always finds its way home. It used to stick on the failure text until
-    // the next refresh, leaving a button that no longer said what it did.
-    if (outcome) {
-      refreshRevert = setTimeout(() => miniLabel(refreshBtn, "refresh", REFRESH_LABEL), 4000);
+    // A second refresh while one is already running is refused rather than interleaved.
+    if (res && res.busy) {
+      liveRun = res.runId;
+      note("A refresh is already running. This button will cancel it.");
+      refreshStatus();
+      return;
     }
-    renderList();
+    if (!res || !res.ok) {
+      restLabel();
+      if (statusBox) {
+        statusBox.hidden = false;
+        statusBox.classList.add("tsc-warn-t");
+        statusBox.textContent = "Last refresh · could not be started. "
+          + "Reload the page and try again.";
+      }
+      note("Refresh could not be started.");
+      return;
+    }
+    liveRun = res.runId;
+    // Everything from here arrives as a broadcast or, if the worker dies first, from
+    // the persisted record the next time this drawer opens.
   });
 
   printBtn = el("button", "tsc-mini");
@@ -1127,9 +1360,22 @@ function floatingUi() {
     cancel.type = "button";
     cancel.appendChild(icon("close", 13));
     cancel.appendChild(document.createTextNode("Cancel"));
+    // A failed save used to blank the box and put the reason in the placeholder - which
+    // meant the reason vanished the instant the user typed the first character of a fix,
+    // and the name they had written was gone too. The reason gets its own line, the
+    // typing survives, and role=alert says it out loud.
+    const err = el("div", "tsc-form-err");
+    err.setAttribute("role", "alert");
+    err.hidden = true;
     const commit = async () => {
       const res = await send({ type: "saveAs", name: name.value });
-      if (!res.ok) { name.value = ""; name.placeholder = res.error; return; }
+      if (!res.ok) {
+        err.hidden = false;
+        err.textContent = res.error;
+        name.focus();
+        name.select();
+        return;
+      }
       savesIdle();
       renderSaves();
       infoToast(res.replaced
@@ -1137,13 +1383,15 @@ function floatingUi() {
         : `Saved "${res.name}" (${res.count} card${res.count === 1 ? "" : "s"})`);
     };
     ok.addEventListener("click", commit);
+    // typing is an attempt to fix it, so the complaint stands down
+    name.addEventListener("input", () => { err.hidden = true; });
     name.addEventListener("keydown", e => {
       if (e.key === "Enter") commit();
       // swallow it: Escape here backs out of naming, not out of the whole drawer
       if (e.key === "Escape") { e.stopPropagation(); savesIdle(); }
     });
     cancel.addEventListener("click", () => savesIdle());
-    savesBox.append(name, ok, cancel);
+    savesBox.append(name, ok, cancel, err);
     name.focus();
     name.select();
   };
@@ -1225,9 +1473,33 @@ function floatingUi() {
   });
 
   const csvBtn = actionButton("tsc-b", "download", "Export CSV");
+  csvBtn.title = "A .csv file of every collected row, with the trade-in columns.";
   csvBtn.addEventListener("click", async () => {
-    const res = await send({ type: "export" });
-    flash(csvBtn, res.ok ? "Downloaded" : res.error);
+    // The worker builds the text; the download happens HERE. A service worker has no
+    // URL.createObjectURL, which is why this used to be a data: URL - the whole sheet
+    // percent-encoded into a URL, truncated by length limits on big buylists and
+    // needing the "downloads" permission to hand to chrome.downloads. A Blob URL from
+    // the page has neither problem and needs no permission at all.
+    const res = await send({ type: "csvText" });
+    if (!res.ok) { flash(csvBtn, res.error); return; }
+    let url = "";
+    try {
+      url = URL.createObjectURL(new Blob([res.text], { type: "text/csv;charset=utf-8" }));
+      const a = el("a");
+      a.href = url;
+      a.download = res.filename;
+      a.rel = "noreferrer";
+      // must be in the document for the click to count as a user-initiated download
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      flash(csvBtn, `Downloaded ${res.count} row${res.count === 1 ? "" : "s"}`);
+    } catch (e) {
+      flash(csvBtn, "Download blocked");
+    } finally {
+      // long enough for the browser to have taken the bytes, short enough not to leak
+      if (url) setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
   });
 
   const clearBtn = actionButton("tsc-b tsc-danger", "trash", "Clear");
@@ -1259,7 +1531,8 @@ function floatingUi() {
 
   exportBtns = [copyBtn, csvBtn, clearBtn];
   foot.append(copyBtn, csvBtn, clearBtn);
-  drawer.append(head, sumBox, rateBox, toolsBox, savesBox, savesList, listBox, foot);
+  drawer.append(head, sumBox, rateBox, toolsBox, statusBox, savesBox, savesList,
+    listBox, foot);
 
   pill = el("button", "tsc-pill");
   pill.type = "button";
@@ -1273,16 +1546,68 @@ function floatingUi() {
 
   document.addEventListener("keydown", e => {
     if (e.key === "Escape" && drawer.classList.contains("tsc-open")) toggleDrawer(false);
+    trapTab(e);
   });
 
   root.append(drawer, pill);
   document.body.appendChild(root);
 }
 
+// Every focusable control the drawer currently owns, in document order. Queried fresh
+// on each Tab because the drawer rebuilds its list, its tools strip and its saves strip
+// constantly - a cached list would trap focus on buttons that no longer exist.
+const FOCUSABLE = "a[href],button:not([disabled]),input:not([disabled]),"
+  + "select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex='-1'])";
+function focusables() {
+  return Array.from(drawer.querySelectorAll(FOCUSABLE))
+    .filter(n => n.offsetParent !== null || n === document.activeElement);
+}
+
+// Tab and Shift+Tab wrap inside the drawer. It is a role="dialog" sitting on top of a
+// full TCGplayer product page; without this, one Tab off the last button walked focus
+// into the page behind it while the dialog was still open and covering it.
+function trapTab(e) {
+  if (e.key !== "Tab" || !drawer.classList.contains("tsc-open")) return;
+  const items = focusables();
+  if (!items.length) return;
+  const first = items[0], last = items[items.length - 1];
+  if (e.shiftKey && (document.activeElement === first || !drawer.contains(document.activeElement))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+// Opening moves focus into the drawer (its Close button - the one control that is always
+// there and never rebuilt); closing puts focus back on the pill that opened it, so the
+// keyboard lands where the user left it rather than at the top of the document.
 function toggleDrawer(open) {
-  drawer.classList.toggle("tsc-open", open);
+  clearTimeout(closeTimer);
+  drawer.classList.remove("tsc-out");
   pill.setAttribute("aria-expanded", String(open));
-  if (open) renderList();
+
+  if (open) {
+    drawer.classList.add("tsc-open");
+    drawer.setAttribute("aria-modal", "true");
+    renderList();
+    refreshStatus();
+    if (drawerClose) drawerClose.focus();
+    return;
+  }
+
+  drawer.removeAttribute("aria-modal");
+  // return focus BEFORE the exit animation: the pill is outside the drawer, so nothing
+  // is left focused inside a surface that is on its way to display:none
+  if (pill && drawer.contains(document.activeElement)) pill.focus();
+  if (reduced()) { drawer.classList.remove("tsc-open"); return; }
+  // .tsc-out runs the entrance in reverse over .16s; display goes back to none after
+  drawer.classList.add("tsc-out");
+  closeTimer = setTimeout(() => {
+    drawer.classList.remove("tsc-open", "tsc-out");
+    closeTimer = 0;
+  }, 180);
 }
 
 // ---------------------------------------------------------------- panel
@@ -1382,7 +1707,18 @@ function alert_(box, text, bad) {
   box.appendChild(el("p", bad ? "tsc-alert tsc-bad" : "tsc-alert", text));
 }
 
+// init() awaits the sales API - twice, with a 1.2s pause between tries. TCGplayer is a
+// SPA, so the user can navigate to another product (or keepMounted can rebuild) while
+// that is in flight, and the old call would then finish and write its chips, its note and
+// its count into a panel belonging to a DIFFERENT card, or into a panel already detached
+// from the document. Each init() takes a generation number; anything stale returns without
+// touching the DOM. `noteBox` is the worst of it - it is a module global, so a late init
+// hijacked the live panel's status line.
+let initGen = 0;
+
 async function init() {
+  const gen = ++initGen;
+  const stale = () => gen !== initGen;
   panel = el("section", "tsc-panel");
   const head = el("div", "tsc-head");
   head.appendChild(mark(18));
@@ -1395,10 +1731,11 @@ async function init() {
   skeleton(body);
   panel.appendChild(body);
 
-  noteBox = el("p", "tsc-note");
+  const myNote = noteBox = el("p", "tsc-note");
   noteBox.setAttribute("role", "status");
   noteBox.setAttribute("aria-live", "polite");
   panel.appendChild(noteBox);
+  const myPanel = panel;
   mount(panel);
 
   // Two tries with a beat between them: the MV3 worker can be mid-wake on the first
@@ -1407,6 +1744,7 @@ async function init() {
   let res, lastErr;
   for (let attempt = 0; attempt < 2 && !res; attempt++) {
     if (attempt) await new Promise(r => setTimeout(r, 1200));
+    if (stale()) return;
     try {
       const r = await send({ type: "firstPage", productId: PID });
       if (r.ok) res = r;
@@ -1415,6 +1753,9 @@ async function init() {
       lastErr = String((e && e.message) || e);
     }
   }
+  // a newer init() (or a rebuild) started while we were waiting: that one owns the panel
+  // and the note line now, and this reply describes a card the user has already left
+  if (stale() || myPanel !== panel || noteBox !== myNote) return;
   if (!res) {
     alert_(body, "Could not read sales: " + lastErr, true);
     return;
@@ -1451,6 +1792,16 @@ async function init() {
     wrap.appendChild(chips);
     body.appendChild(wrap);
   }
+
+  // Shift-click was documented only in a title attribute, which is to say it was
+  // documented nowhere: nobody hovers a button they have already decided to click.
+  // One line under the chips, where the decision is actually made.
+  const hint = el("p", "tsc-hint");
+  hint.appendChild(document.createTextNode("Click a grade to add a copy. "));
+  hint.appendChild(el("b", null, "Shift-click"));
+  hint.appendChild(document.createTextNode(
+    " re-pulls its price without changing the count."));
+  body.appendChild(hint);
 }
 
 // The pure parts - the money arithmetic, the printed document, the undo wording - are

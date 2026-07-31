@@ -254,6 +254,21 @@ async function getFx(now) {
 
 // ---------------------------------------------------------------- row build
 
+// The set and number are the ONLY DOM-derived data in the extension (scrapePageMeta in
+// content.js), and the heuristics there fail SILENTLY: a redesigned breadcrumb hands back
+// an empty set, a moved details block an empty or garbled number, and the wrong text ends
+// up on a customer-facing sheet with nothing flagging it. A plausible card number is one
+// unbroken token ("223/197", "13", "SV045"); anything with spaces - or an empty set -
+// marks the row so the drawer can say "check the set and number" instead of exporting a
+// guess. Underscore-prefixed, so the flag itself stays out of the spreadsheet.
+const NUMBER_SHAPE = /^\S+$/;
+
+function metaLooksWrong(meta) {
+  const set = meta && typeof meta.set === "string" ? meta.set.trim() : "";
+  const number = meta && typeof meta.number === "string" ? meta.number.trim() : "";
+  return !set || !NUMBER_SHAPE.test(number);
+}
+
 function buildRow(meta, sel, matched, fx, now) {
   now = now || Date.now();
 
@@ -284,6 +299,7 @@ function buildRow(meta, sel, matched, fx, now) {
   const rate = fx && typeof fx.rate === "number" ? fx.rate : null;
 
   return {
+    _meta_warn: metaLooksWrong(meta),
     name: meta.name,
     set: meta.set,
     number: meta.number,
@@ -599,26 +615,48 @@ async function collect(msg, fetchPage) {
 // Progress and cancellation for the long-running refresh. A 50-row collection is 50
 // sequential paging runs; with no progress and no way out, the only honest option the
 // user had was to close the tab.
-let cancelRefresh = false;
+//
+// State is PER-RUN, not module-global: with shared flags, Cancel pressed in one tab
+// stopped a refresh started in another, and progress redirected to whichever tab asked
+// last. `refreshRun` holds the ONE live run - a second "refreshAll" while it runs is
+// refused with { busy: true } instead of interleaving - and cancellation targets the
+// live run by id, so a Cancel left over from a finished run cannot kill the next one.
+//
+// The run's progress is also persisted to chrome.storage.local per row (REFRESH_KEY:
+// { id, done, total, failedKeys, ... , finished }). MV3 can kill the worker mid-run,
+// and a long run can outlive the single sendResponse callback; without the record, a
+// 40-of-50 refresh reported as TOTAL failure and the failedKeys - the whole point of
+// the run - evaporated with the worker. The caller gets { started: true, runId }
+// straight away, progress streams as broadcasts, and the final result travels BOTH as
+// a "refreshDone" broadcast and as the persisted record ("refreshStatus" reads it), so
+// partial success is never reported as no success.
+const REFRESH_KEY = "refreshRun";
+let refreshRun = null;   // { id, cancel, tab, promise } - the one live run, or null
 
-// The tab that asked for the current refresh. chrome.runtime.sendMessage from a service
-// worker reaches extension pages, NOT content scripts - a content script is only
-// addressable through chrome.tabs.sendMessage with its tab id, which the onMessage
-// listener below hands us from `sender`.
-let progressTab = null;
-
-function broadcast(msg) {
+// chrome.runtime.sendMessage from a service worker reaches extension pages, NOT content
+// scripts - a content script is only addressable through chrome.tabs.sendMessage with
+// its tab id, which the onMessage listener below hands us from `sender`.
+function broadcast(run, msg) {
   try {
-    if (progressTab === null || typeof chrome === "undefined" ||
+    if (!run || run.tab === null || typeof chrome === "undefined" ||
         !chrome.tabs || !chrome.tabs.sendMessage) return;
-    const p = chrome.tabs.sendMessage(progressTab, msg);
+    const p = chrome.tabs.sendMessage(run.tab, msg);
     if (p && p.catch) p.catch(() => {});   // the tab closed or navigated: not our problem
   } catch (e) { /* same */ }
 }
 
+async function saveRefreshRecord(rec) {
+  try { await chrome.storage.local.set({ [REFRESH_KEY]: rec }); } catch (e) { /* non-fatal */ }
+}
+
+async function readRefreshRecord() {
+  try { return (await chrome.storage.local.get(REFRESH_KEY))[REFRESH_KEY] || null; }
+  catch (e) { return null; }
+}
+
 // Re-pull every collected row at today's rate. Sequential on purpose: the sales API is
 // the bottleneck and a burst of parallel paging is how you get rate limited.
-async function refreshAll(fetchPage) {
+async function runRefresh(run, fetchPage) {
   const store = await loadStore();
   const keys = Object.keys(store);
   let refreshed = 0;
@@ -631,11 +669,17 @@ async function refreshAll(fetchPage) {
   let cancelled = false;
   let done = 0;
 
-  cancelRefresh = false;
-  broadcast({ type: "refreshProgress", done: 0, total: keys.length });
+  const record = finished => ({
+    id: run.id, at: new Date().toISOString(), done, total: keys.length,
+    refreshed, failed, skipped, fxFailed, failedKeys: failedKeys.slice(),
+    cancelled, finished: !!finished
+  });
+
+  await saveRefreshRecord(record(false));
+  broadcast(run, { type: "refreshProgress", runId: run.id, done: 0, total: keys.length });
 
   for (const key of keys) {
-    if (cancelRefresh) { cancelled = true; break; }
+    if (run.cancel) { cancelled = true; break; }
     const row = store[key];
     const productId = key.split("|")[0];
     const sel = {
@@ -661,13 +705,15 @@ async function refreshAll(fetchPage) {
       failedKeys.push(key);
     }
     done++;
-    broadcast({ type: "refreshProgress", done, total: keys.length });
+    // one write per row: if the worker dies on row 41 of 50, the record still names
+    // the 40 that finished and every key that failed so far
+    await saveRefreshRecord(record(false));
+    broadcast(run, { type: "refreshProgress", runId: run.id, done, total: keys.length });
   }
 
-  broadcast({ type: "refreshProgress", done, total: keys.length, finished: true });
-
-  return {
+  const result = {
     ok: true,
+    runId: run.id,
     refreshed,
     failed,
     failedKeys,
@@ -680,27 +726,46 @@ async function refreshAll(fetchPage) {
     partial: failed > 0 || fxFailed > 0 || cancelled,
     count: Object.keys(await loadStore()).length
   };
+
+  await saveRefreshRecord(record(true));
+  broadcast(run, { type: "refreshDone", runId: run.id, result });
+  return result;
+}
+
+// Starts a run and answers immediately. The content script drives completion from the
+// refreshDone broadcast plus the persisted record, never from this response.
+function startRefreshAll(fetchPage, tabId) {
+  if (refreshRun) {
+    return { ok: false, busy: true, runId: refreshRun.id,
+             error: "a refresh is already running" };
+  }
+  const run = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    cancel: false,
+    tab: tabId === undefined ? null : tabId
+  };
+  refreshRun = run;
+  run.promise = runRefresh(run, fetchPage)
+    .catch(e => ({ ok: false, error: String((e && e.message) || e) }))
+    .finally(() => { if (refreshRun === run) refreshRun = null; });
+  return { ok: true, started: true, runId: run.id };
+}
+
+// Start-and-wait convenience: the same run machinery (including the busy refusal), but
+// resolved with the full result. Tests use it; the message path never does.
+async function refreshAll(fetchPage) {
+  const started = startRefreshAll(fetchPage);
+  if (!started.ok) return started;
+  return refreshRun.promise;
 }
 
 async function exportRows() {
   return withTrade(listRows(await loadStore()), await getPct());
 }
 
-async function exportCsv() {
-  const rows = await exportRows();
-  if (!rows.length) return { ok: false, error: "nothing collected yet" };
-  await chrome.downloads.download({
-    url: "data:text/csv;charset=utf-8,"
-      + encodeURIComponent(toDelimited(rows, ",", EXPORT_COLUMNS)),
-    filename: `tcg-sales-${new Date().toISOString().slice(0, 10)}.csv`,
-    saveAs: false
-  });
-  return { ok: true, count: rows.length };
-}
-
 // ---------------------------------------------------------------- messages
 
-async function handle(msg, fetchPage) {
+async function handle(msg, fetchPage, senderTab) {
   switch (msg.type) {
     case "firstPage": {
       const page = await fetchSalesPage(msg.productId, 0);
@@ -716,10 +781,22 @@ async function handle(msg, fetchPage) {
     case "collect":
       return collect(msg, fetchPage);
     case "refreshAll":
-      return refreshAll(fetchPage);
+      return startRefreshAll(fetchPage, senderTab);
     case "cancelRefresh":
-      cancelRefresh = true;
+      // Cancellation is scoped to the live run. A caller naming a runId may only stop
+      // that run; a stale Cancel from a finished run falls through harmlessly.
+      if (!refreshRun || (msg.runId && msg.runId !== refreshRun.id)) {
+        return { ok: false, error: "no such refresh" };
+      }
+      refreshRun.cancel = true;
       return { ok: true };
+    // The persisted progress/result of the latest run, for a drawer that opened after
+    // the run started, another tab, or a run whose worker died partway through.
+    case "refreshStatus": {
+      const rec = await readRefreshRecord();
+      return { ok: true, record: rec,
+               running: !!(refreshRun && rec && refreshRun.id === rec.id) };
+    }
     case "list": {
       const rows = listRows(await loadStore());
       const pct = await getPctState();
@@ -790,8 +867,19 @@ async function handle(msg, fetchPage) {
         }
         return { ok: true, restored, kept, count: Object.keys(store).length };
       });
-    case "export":
-      return exportCsv();
+    // The CSV text plus a filename. The content script builds a Blob URL and clicks a
+    // download link itself: an MV3 service worker has no URL.createObjectURL, and a
+    // data: URL re-encodes the whole sheet into the URL bar's worst format.
+    case "csvText": {
+      const rows = await exportRows();
+      if (!rows.length) return { ok: false, error: "nothing collected yet" };
+      return {
+        ok: true,
+        text: toDelimited(rows, ",", EXPORT_COLUMNS),
+        filename: `tcg-sales-${new Date().toISOString().slice(0, 10)}.csv`,
+        count: rows.length
+      };
+    }
     case "copyText": {
       const rows = await exportRows();
       if (!rows.length) return { ok: false, error: "nothing collected yet" };
@@ -842,24 +930,27 @@ async function handle(msg, fetchPage) {
         Object.assign(store, snapshot(msg.store || {}));
         return { ok: true, count: Object.keys(store).length };
       });
-    case "deleteSaved": {
-      const saved = await loadSaved();
-      if (!saved[msg.name]) return { ok: false, error: "No such buylist" };
-      delete saved[msg.name];
-      await chrome.storage.local.set({ [SAVED_KEY]: saved });
-      return { ok: true, saves: savedList(saved) };
-    }
+    // Serialized like saveAs: this is a read-modify-write of the saves map, and running
+    // it outside the queue let a delete racing a queued save clobber the save (or
+    // resurrect the deleted buylist) depending on which write landed last.
+    case "deleteSaved":
+      return withStore(async () => {
+        const saved = await loadSaved();
+        if (!saved[msg.name]) return { ok: false, error: "No such buylist" };
+        delete saved[msg.name];
+        await chrome.storage.local.set({ [SAVED_KEY]: saved });
+        return { ok: true, saves: savedList(saved) };
+      });
   }
   throw new Error("unknown message: " + msg.type);
 }
 
 if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage) {
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    // Remember who asked, so a long refresh can stream its position back to that drawer.
-    if (msg && msg.type === "refreshAll" && sender && sender.tab) {
-      progressTab = sender.tab.id;
-    }
-    handle(msg).then(
+    // The asking tab's id travels into handle(), so a long refresh can stream its
+    // position back to the drawer that started it - and only that drawer.
+    const tab = sender && sender.tab ? sender.tab.id : undefined;
+    handle(msg, undefined, tab).then(
       sendResponse,
       err => sendResponse({ ok: false, error: String((err && err.message) || err) })
     );
@@ -873,7 +964,8 @@ if (typeof module !== "undefined") {
     COLUMNS, TRADE_COLUMNS, TRUST_COLUMNS, EXPORT_COLUMNS,
     MAX_PAGES, PAGE_SIZE, SAMPLES, STALE_DAYS, LOW_SAMPLES, DEFAULT_PCT,
     matchesSelection, collectSales, buildRow, toDelimited, looksLoggedOut,
-    getFx, collect, handle, fetchSalesPage, refreshAll, listRows, clampPct,
+    getFx, collect, handle, fetchSalesPage, refreshAll, startRefreshAll, listRows,
+    clampPct, metaLooksWrong,
     csvCell, tsvCell, isUsableSale, salePrice, saleTime, withTrade, getPct,
     getPctState, neutralise, round2
   };

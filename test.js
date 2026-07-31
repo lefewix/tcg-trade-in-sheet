@@ -365,7 +365,9 @@ async function main() {
     // only the sales matching its own selection
     const both = MATCHING.map(r => Object.assign({}, r, { purchasePrice: 20 }))
       .concat(MATCHING.map(r => Object.assign({}, r, { purchasePrice: 20, language: "Japanese" })));
-    const res = await bg.handle({ type: "refreshAll" }, () =>
+    // handle("refreshAll") now answers { started: true } and finishes in the background,
+    // so the start-and-wait helper is what a synchronous test wants. Same run machinery.
+    const res = await bg.refreshAll(() =>
       Promise.resolve({ previousPage: "", nextPage: "", resultCount: 10, totalResults: 10,
         data: both }));
     assert.strictEqual(res.refreshed, 2);
@@ -534,7 +536,7 @@ async function main() {
     // FX is down for the whole suite (global.fetch throws), prices moved to 20.00
     const dearer = () => Promise.resolve({ previousPage: "", nextPage: "", resultCount: 5,
       totalResults: 5, data: MATCHING.map(r => Object.assign({}, r, { purchasePrice: 20 })) });
-    const res = await bg.handle({ type: "refreshAll" }, dearer);
+    const res = await bg.refreshAll(dearer);
 
     const row = (await bg.handle({ type: "list" })).rows[0];
     assert.strictEqual(row.avg_usd, "20.00", "the USD side still refreshes");
@@ -564,7 +566,7 @@ async function main() {
     await bg.handle({ type: "setPct", key: b.key, pct: "45" });
 
     let deleted = false;
-    const res = await bg.handle({ type: "refreshAll" }, async () => {
+    const res = await bg.refreshAll(async () => {
       // delete the OTHER row mid-refresh, exactly as a click in the drawer would
       if (!deleted) { deleted = true; await bg.handle({ type: "remove", key: b.key }); }
       return { previousPage: "", nextPage: "", resultCount: 5, totalResults: 5,
@@ -744,7 +746,7 @@ async function main() {
     const stamps = {};
     for (const r of (await bg.handle({ type: "list" })).rows) stamps[r.key] = r._addedAt;
 
-    await bg.handle({ type: "refreshAll" }, page5);
+    await bg.refreshAll(page5);
     const after = (await bg.handle({ type: "list" })).rows;
     assert.deepStrictEqual(after.map(r => r.key), before, "refresh preserves drawer order");
     for (const r of after) {
@@ -1126,7 +1128,7 @@ async function main() {
     const c = await bg.collect({ productId: "72", sel: SEL, meta: META }, page5);
 
     // the middle product 404s
-    const res = await bg.handle({ type: "refreshAll" }, (id) => {
+    const res = await bg.refreshAll((id) => {
       if (id === "71") return Promise.reject(new Error("latestsales 404"));
       return page5();
     });
@@ -1142,7 +1144,7 @@ async function main() {
       await bg.collect({ productId: id, sel: SEL, meta: META }, page5);
     }
     let seen = 0;
-    const stopped = await bg.handle({ type: "refreshAll" }, async () => {
+    const stopped = await bg.refreshAll(async () => {
       seen++;
       if (seen === 2) await bg.handle({ type: "cancelRefresh" });
       return { previousPage: "", nextPage: "", resultCount: 5, totalResults: 5,
@@ -1155,11 +1157,170 @@ async function main() {
     assert.strictEqual(stopped.count, 4, "cancelling drops nothing");
 
     // the next run starts fresh rather than inheriting the cancellation
-    const after = await bg.handle({ type: "refreshAll" }, page5);
+    const after = await bg.refreshAll(page5);
     assert.strictEqual(after.cancelled, false);
     assert.strictEqual(after.refreshed, 4);
     passed++;
     console.log("ok  (async) refresh-all names the rows that failed and can be cancelled");
+  }
+
+  // 37 - the refresh record. An MV3 service worker can be torn down at any moment, and a
+  // 50-row refresh is 50 sequential paging runs - easily long enough to be killed partway.
+  // Before this, the whole outcome lived in one sendResponse callback that died with the
+  // worker, so 40 refreshed rows were reported as "Refresh failed" and the failedKeys -
+  // the entire reason to run it - were lost. Progress is now written per row, so whatever
+  // the worker managed is on disk before it dies.
+  {
+    chrome.storage.local._d = {};
+    const rows = [];
+    for (const id of ["90", "91", "92", "93"]) {
+      rows.push(await bg.collect({ productId: id, sel: SEL, meta: META }, page5));
+    }
+    let mid = null;
+    const res = await bg.refreshAll(async id => {
+      // snapshot the record as it stands while the run is still going
+      if (id === "92") mid = clone(chrome.storage.local._d.refreshRun);
+      if (id === "93") throw new Error("latestsales 500");
+      return page5();
+    });
+
+    assert.ok(mid, "the record is written DURING the run, not only at the end");
+    assert.strictEqual(mid.total, 4);
+    assert.strictEqual(mid.done, 2, "two rows finished before this one started");
+    assert.strictEqual(mid.refreshed, 2);
+    assert.strictEqual(mid.finished, false, "an unfinished record is how worker death reads");
+
+    const status = await bg.handle({ type: "refreshStatus" });
+    assert.strictEqual(status.ok, true);
+    assert.strictEqual(status.running, false, "nothing is in flight once the run ends");
+    assert.strictEqual(status.record.id, res.runId, "the record names its run");
+    assert.strictEqual(status.record.finished, true);
+    assert.strictEqual(status.record.refreshed, 3,
+      "three rows succeeded and the record says so - partial success is not total failure");
+    assert.strictEqual(status.record.failed, 1);
+    assert.deepStrictEqual(status.record.failedKeys, [rows[3].key],
+      "and the failed key survives the run, so the drawer can still flag that row");
+    passed++;
+    console.log("ok  (async) refresh progress and partial results are persisted per row");
+  }
+
+  // 38 - two tabs, two Refresh buttons. The run state used to be module globals, so the
+  // second press interleaved with the first: both walked the same key list, and a Cancel
+  // in either tab stopped both. The second press is now refused outright.
+  {
+    chrome.storage.local._d = {};
+    await bg.collect({ productId: "94", sel: SEL, meta: META }, page5);
+    await bg.collect({ productId: "95", sel: SEL, meta: META }, page5);
+
+    let release;
+    const gate = new Promise(r => { release = r; });
+    const first = bg.refreshAll(async () => { await gate; return page5(); });
+
+    const second = await bg.handle({ type: "refreshAll" }, page5);
+    assert.strictEqual(second.ok, false);
+    assert.strictEqual(second.busy, true, "a second refreshAll is refused, not interleaved");
+    assert.ok(second.runId, "and it names the run already holding the floor");
+
+    // a Cancel naming some OTHER run must not touch the live one
+    const wrongCancel = await bg.handle({ type: "cancelRefresh", runId: "not-a-real-run" });
+    assert.strictEqual(wrongCancel.ok, false, "cancellation is scoped to its own run");
+
+    release();
+    const done = await first;
+    assert.strictEqual(done.ok, true);
+    assert.strictEqual(done.cancelled, false, "the live run finished untouched");
+    assert.strictEqual(done.refreshed, 2);
+
+    // and once it is over the floor is free again
+    const third = await bg.refreshAll(page5);
+    assert.strictEqual(third.ok, true);
+    assert.strictEqual(third.refreshed, 2);
+    assert.notStrictEqual(third.runId, done.runId, "a new run gets a new id");
+    passed++;
+    console.log("ok  (async) a second concurrent refreshAll is refused with busy");
+  }
+
+  // 39 - deleteSaved was a read-modify-write running OUTSIDE the mutation queue, racing
+  // the queued saveAs against the same map. Whichever wrote last won, so a delete could
+  // erase a save that landed after it read, or resurrect the buylist it had just deleted.
+  {
+    chrome.storage.local._d = {};
+    await bg.collect({ productId: "96", sel: SEL, meta: META }, page5);
+    await bg.handle({ type: "saveAs", name: "A" });
+    await bg.handle({ type: "saveAs", name: "B" });
+
+    // fired together, with no await between them: this is the race
+    const [del, save] = await Promise.all([
+      bg.handle({ type: "deleteSaved", name: "A" }),
+      bg.handle({ type: "saveAs", name: "C" })
+    ]);
+    assert.strictEqual(del.ok, true);
+    assert.strictEqual(save.ok, true);
+
+    const names = (await bg.handle({ type: "listSaved" })).saves.map(s => s.name).sort();
+    assert.deepStrictEqual(names, ["B", "C"],
+      "the delete and the save both land: neither clobbers the other");
+
+    // deleting something that is not there is still an honest error, not a silent ok
+    assert.strictEqual((await bg.handle({ type: "deleteSaved", name: "A" })).ok, false);
+    passed++;
+    console.log("ok  (async) deleteSaved is serialized with saveAs through the queue");
+  }
+
+  // 40 - the set and the number are the only DOM-scraped fields in the extension, and
+  // both heuristics fail silently. A wrong set on a customer-facing sheet is a dispute,
+  // so a scrape that does not look right flags its row instead of exporting a guess.
+  {
+    assert.strictEqual(bg.metaLooksWrong(META), false, "a clean scrape is not flagged");
+    assert.strictEqual(bg.buildRow(META, SEL, MATCHING, FX, NOW)._meta_warn, false);
+
+    // the breadcrumb heuristic came back with nothing
+    assert.strictEqual(bg.metaLooksWrong({ set: "", number: "223/197" }), true);
+    assert.strictEqual(bg.metaLooksWrong({ set: "   ", number: "223/197" }), true);
+    // the "Card Number / Rarity:" regex missed, or swallowed the rarity with it
+    assert.strictEqual(bg.metaLooksWrong({ set: "SV: Obsidian Flames", number: "" }), true);
+    assert.strictEqual(
+      bg.metaLooksWrong({ set: "SV: Obsidian Flames", number: "13 / 108 Ultra Rare" }), true,
+      "a card number is one unbroken token, never a sentence");
+    // the shapes that are genuinely fine
+    assert.strictEqual(bg.metaLooksWrong({ set: "SV: Obsidian Flames", number: "13" }), false);
+    assert.strictEqual(bg.metaLooksWrong({ set: "Base Set", number: "SV045" }), false);
+    assert.strictEqual(bg.metaLooksWrong({ set: "Base Set", number: "223/197" }), false);
+    assert.strictEqual(bg.metaLooksWrong(null), true, "no meta at all is the worst case");
+
+    const bad = bg.buildRow(
+      { name: META.name, set: "", number: "13", url: META.url }, SEL, MATCHING, FX, NOW);
+    assert.strictEqual(bad._meta_warn, true, "the flag rides on the row itself");
+    assert.strictEqual(bad.avg_usd, "12.70", "and changes nothing about the price");
+    passed++;
+    console.log("ok  a doubtful set/number scrape flags its row; a clean one does not");
+  }
+
+  // 41 - the percent inputs carry max="1000" so the spinner and the arrow keys stop
+  // there, but a number input's max is advisory in every browser that ships one. The
+  // clamp that binds is this one, and it stays exactly where it is.
+  {
+    assert.strictEqual(bg.clampPct("150"), 150,
+      "over 100 is allowed - a shop occasionally pays over market on purpose");
+    assert.strictEqual(bg.clampPct("1000"), 1000, "1000 is the ceiling, not past it");
+    assert.strictEqual(bg.clampPct("5000"), 1000, "and anything above it is pulled down");
+    assert.strictEqual(bg.clampPct("-5"), 0, "no negative rates");
+    assert.strictEqual(bg.clampPct("62.55"), 62.6, "one decimal place, rounded");
+    assert.strictEqual(bg.clampPct(""), null, "an empty box is no answer, not zero");
+    assert.strictEqual(bg.clampPct("abc"), null);
+    assert.strictEqual(bg.clampPct("0"), 0, "zero is a real house rate");
+
+    chrome.storage.local._d = {};
+    const g = await bg.handle({ type: "setGlobalPct", pct: "9999" });
+    assert.strictEqual(g.pct, 1000, "typed past the max, stored at it");
+    assert.strictEqual(g.pctSet, true);
+
+    const row = await bg.collect({ productId: "97", sel: SEL, meta: META }, page5);
+    assert.strictEqual((await bg.handle({ type: "setPct", key: row.key, pct: "4000" })).pct,
+      1000, "the per-row box is clamped by the same rule");
+    assert.strictEqual((await bg.handle({ type: "setPct", key: row.key, pct: "-1" })).pct, 0);
+    passed++;
+    console.log("ok  (async) percent inputs are clamped to 0-1000 on the storage side");
   }
 
   console.log(`\n${passed} assertion groups passed`);
