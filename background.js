@@ -11,6 +11,7 @@
 // back logged-out-shaped and looksLoggedOut() below catches it.
 
 const API = "https://mpapi.tcgplayer.com/v2/product";
+const DETAILS_API = "https://mp-search-api.tcgplayer.com/v1/product";
 
 const PAGE_SIZE = 25;   // server cap; a larger `limit` is ignored
 const MAX_PAGES = 10;   // a rare condition on a busy product must not spin forever
@@ -263,6 +264,56 @@ async function getFx(now) {
 // guess. Underscore-prefixed, so the flag itself stays out of the spreadsheet.
 const NUMBER_SHAPE = /^\S+$/;
 
+// Canonical set/number/name from the product-details endpoint - the same API family the
+// sales data already comes from. The DOM scrape in content.js only ever understood the
+// Pokemon page layout ("Card Number / Rarity: ..."); One Piece, Magic and others render
+// split attribute rows and scraped an empty number on EVERY card, tripping _meta_warn on
+// rows that were otherwise fine. The API returns typed fields for every game, so it is
+// the primary source and the scrape is the fallback when this call fails.
+//
+// Same trust rules as every other API field: a number that is not one unbroken token, or
+// an empty set, is treated as absent rather than believed. Any failure returns null and
+// the caller keeps the DOM meta - this can only ever improve on the scrape, not replace
+// good data with garbage. Undocumented endpoint, so failure is an expected steady state,
+// not an exception: hence the timeout and the blanket catch.
+async function fetchProductMeta(productId) {
+  // Node test runs must never hit the live API; tests inject a stub instead.
+  if (typeof chrome === "undefined") return null;
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 5000);
+    const res = await fetch(`${DETAILS_API}/${productId}/details`, {
+      credentials: "include", signal: ctl.signal
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const j = await res.json();
+    const number = j && j.customAttributes && typeof j.customAttributes.number === "string"
+      ? j.customAttributes.number.trim() : "";
+    const set = j && typeof j.setName === "string" ? j.setName.trim() : "";
+    const name = j && typeof j.productName === "string" ? j.productName.trim() : "";
+    return {
+      number: NUMBER_SHAPE.test(number) ? number : "",
+      set,
+      name
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Field-by-field: the API wins where it has a clean value, the scrape fills the gaps.
+// `url` always comes from the page - the API does not know what tab the user is on.
+function mergeMeta(domMeta, apiMeta) {
+  if (!apiMeta) return domMeta;
+  return {
+    name: apiMeta.name || (domMeta && domMeta.name) || "",
+    set: apiMeta.set || (domMeta && domMeta.set) || "",
+    number: apiMeta.number || (domMeta && domMeta.number) || "",
+    url: (domMeta && domMeta.url) || ""
+  };
+}
+
 function metaLooksWrong(meta) {
   const set = meta && typeof meta.set === "string" ? meta.set.trim() : "";
   const number = meta && typeof meta.number === "string" ? meta.number.trim() : "";
@@ -511,8 +562,9 @@ function clampPct(v) {
   return Math.min(1000, Math.max(0, Math.round(n * 10) / 10));
 }
 
-async function collect(msg, fetchPage) {
-  const { productId, sel, meta } = msg;
+async function collect(msg, fetchPage, fetchDetails) {
+  const { productId, sel } = msg;
+  fetchDetails = fetchDetails || fetchProductMeta;
   const res = await collectSales(productId, sel, fetchPage);
   if (!res.matched.length) {
     return {
@@ -523,6 +575,10 @@ async function collect(msg, fetchPage) {
         : `no sale matched this printing and grade, ${res.rejected} rejected`
     };
   }
+
+  // API meta first, scraped meta as the fallback (see fetchProductMeta). Fetched after
+  // the sales pull so a product with no usable sales never pays for the extra request.
+  const meta = mergeMeta(msg.meta, await fetchDetails(productId));
 
   const fx = await getFx();
   const fxFailed = fx.rate === null;
@@ -656,7 +712,7 @@ async function readRefreshRecord() {
 
 // Re-pull every collected row at today's rate. Sequential on purpose: the sales API is
 // the bottleneck and a burst of parallel paging is how you get rate limited.
-async function runRefresh(run, fetchPage) {
+async function runRefresh(run, fetchPage, fetchDetails) {
   const store = await loadStore();
   const keys = Object.keys(store);
   let refreshed = 0;
@@ -690,7 +746,8 @@ async function runRefresh(run, fetchPage) {
     const meta = { name: row.name, set: row.set, number: row.number, url: row._url };
     try {
       const res = await collect(
-        { productId, sel, meta, mode: "refresh", onlyIfPresent: true }, fetchPage);
+        { productId, sel, meta, mode: "refresh", onlyIfPresent: true },
+        fetchPage, fetchDetails);
       if (res.ok) {
         refreshed++;
         if (res.fxFailed) fxFailed++;
@@ -734,7 +791,7 @@ async function runRefresh(run, fetchPage) {
 
 // Starts a run and answers immediately. The content script drives completion from the
 // refreshDone broadcast plus the persisted record, never from this response.
-function startRefreshAll(fetchPage, tabId) {
+function startRefreshAll(fetchPage, tabId, fetchDetails) {
   if (refreshRun) {
     return { ok: false, busy: true, runId: refreshRun.id,
              error: "a refresh is already running" };
@@ -745,7 +802,7 @@ function startRefreshAll(fetchPage, tabId) {
     tab: tabId === undefined ? null : tabId
   };
   refreshRun = run;
-  run.promise = runRefresh(run, fetchPage)
+  run.promise = runRefresh(run, fetchPage, fetchDetails)
     .catch(e => ({ ok: false, error: String((e && e.message) || e) }))
     .finally(() => { if (refreshRun === run) refreshRun = null; });
   return { ok: true, started: true, runId: run.id };
@@ -753,8 +810,8 @@ function startRefreshAll(fetchPage, tabId) {
 
 // Start-and-wait convenience: the same run machinery (including the busy refusal), but
 // resolved with the full result. Tests use it; the message path never does.
-async function refreshAll(fetchPage) {
-  const started = startRefreshAll(fetchPage);
+async function refreshAll(fetchPage, fetchDetails) {
+  const started = startRefreshAll(fetchPage, undefined, fetchDetails);
   if (!started.ok) return started;
   return refreshRun.promise;
 }
@@ -765,7 +822,7 @@ async function exportRows() {
 
 // ---------------------------------------------------------------- messages
 
-async function handle(msg, fetchPage, senderTab) {
+async function handle(msg, fetchPage, senderTab, fetchDetails) {
   switch (msg.type) {
     case "firstPage": {
       const page = await fetchSalesPage(msg.productId, 0);
@@ -779,9 +836,9 @@ async function handle(msg, fetchPage, senderTab) {
       };
     }
     case "collect":
-      return collect(msg, fetchPage);
+      return collect(msg, fetchPage, fetchDetails);
     case "refreshAll":
-      return startRefreshAll(fetchPage, senderTab);
+      return startRefreshAll(fetchPage, senderTab, fetchDetails);
     case "cancelRefresh":
       // Cancellation is scoped to the live run. A caller naming a runId may only stop
       // that run; a stale Cancel from a finished run falls through harmlessly.
@@ -965,7 +1022,7 @@ if (typeof module !== "undefined") {
     MAX_PAGES, PAGE_SIZE, SAMPLES, STALE_DAYS, LOW_SAMPLES, DEFAULT_PCT,
     matchesSelection, collectSales, buildRow, toDelimited, looksLoggedOut,
     getFx, collect, handle, fetchSalesPage, refreshAll, startRefreshAll, listRows,
-    clampPct, metaLooksWrong,
+    clampPct, metaLooksWrong, fetchProductMeta, mergeMeta,
     csvCell, tsvCell, isUsableSale, salePrice, saleTime, withTrade, getPct,
     getPctState, neutralise, round2
   };

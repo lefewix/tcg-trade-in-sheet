@@ -103,9 +103,15 @@ function scrapePageMeta() {
     .filter(Boolean);
   const set = crumbs.length ? crumbs[crumbs.length - 1] : SLUG;
 
-  // "Card Number / Rarity: 13/108 / Ultra Rare"  ->  "13/108"
-  const m = document.body.innerText.match(/Card Number\s*\/\s*Rarity:\s*(.+)/);
-  const number = m ? m[1].split(" / ")[0].trim() : "";
+  // This whole scrape is now the FALLBACK - the worker asks the product-details API
+  // first (fetchProductMeta in background.js) and only keeps these values when that
+  // call fails. Two page layouts are understood:
+  //   Pokemon:            "Card Number / Rarity: 13/108 / Ultra Rare"  ->  "13/108"
+  //   One Piece / Magic:  "Number: OP14-033" on its own attribute row  ->  "OP14-033"
+  const text = document.body.innerText;
+  const m = text.match(/Card Number\s*\/\s*Rarity:\s*(.+)/);
+  const split = text.match(/^\s*Number:?\s+(\S+)\s*$/m);
+  const number = m ? m[1].split(" / ")[0].trim() : (split ? split[1] : "");
 
   const meta = {
     name: name || SLUG,

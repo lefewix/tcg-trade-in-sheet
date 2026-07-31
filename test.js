@@ -1323,6 +1323,62 @@ async function main() {
     console.log("ok  (async) percent inputs are clamped to 0-1000 on the storage side");
   }
 
+  // 42 - set/number come from the product-details API first, because the DOM scrape
+  // only ever understood the Pokemon layout: One Piece pages render "Number: OP14-033"
+  // on its own row, so every One Piece card scraped an empty number and wore the
+  // _meta_warn flag permanently. The API answer wins field by field; the scrape fills
+  // gaps; a dead or garbled API call keeps the scrape untouched.
+  {
+    // precedence: API wins where it has a value, DOM fills what it lacks, url is DOM's
+    const dom = { name: "scraped", set: "scraped set", number: "", url: "https://x/p/1" };
+    const api = { name: "Perona - OP14-033 (Alternate Art)",
+                  set: "The Azure Sea's Seven", number: "OP14-033" };
+    assert.deepStrictEqual(bg.mergeMeta(dom, api), {
+      name: api.name, set: api.set, number: api.number, url: dom.url
+    });
+    assert.deepStrictEqual(bg.mergeMeta(dom, null), dom,
+      "a failed details call keeps the scrape verbatim");
+    assert.deepStrictEqual(
+      bg.mergeMeta(dom, { name: "", set: "", number: "OP14-033" }),
+      { name: dom.name, set: dom.set, number: "OP14-033", url: dom.url },
+      "the API fills only the fields it actually has");
+
+    // through collect(): a One Piece style scrape (empty number) is repaired by the
+    // API and the row is NOT flagged
+    chrome.storage.local._d = {};
+    const onePiece = { name: "Perona", set: "One Piece Card Game", number: "",
+                       url: "https://x/p/666527" };
+    const good = await bg.collect(
+      { productId: "666527", sel: SEL, meta: onePiece }, page5, async () => api);
+    assert.strictEqual(good.ok, true);
+    let rows = bg.listRows(chrome.storage.local._d.rows);
+    assert.strictEqual(rows[0].number, "OP14-033");
+    assert.strictEqual(rows[0].set, "The Azure Sea's Seven");
+    assert.strictEqual(rows[0]._meta_warn, false,
+      "an API-repaired row does not wear the warning");
+
+    // API down: the scrape stands, and a bad scrape is still honestly flagged
+    chrome.storage.local._d = {};
+    const dead = await bg.collect(
+      { productId: "666527", sel: SEL, meta: onePiece }, page5, async () => null);
+    assert.strictEqual(dead.ok, true);
+    rows = bg.listRows(chrome.storage.local._d.rows);
+    assert.strictEqual(rows[0].number, "", "no invented number");
+    assert.strictEqual(rows[0]._meta_warn, true,
+      "with the API dead the flag still catches the bad scrape");
+
+    // the default fetcher never throws into collect: the suite-wide offline fetch stub
+    // throws, and collect must land on the DOM meta as if the call had returned null
+    chrome.storage.local._d = {};
+    const offline = await bg.collect(
+      { productId: "666527", sel: SEL, meta: onePiece }, page5);
+    assert.strictEqual(offline.ok, true, "a throwing fetch is a null answer, not a crash");
+    assert.strictEqual(
+      bg.listRows(chrome.storage.local._d.rows)[0]._meta_warn, true);
+    passed++;
+    console.log("ok  (async) product-details API repairs scraped set/number, scrape is the fallback");
+  }
+
   console.log(`\n${passed} assertion groups passed`);
 }
 
