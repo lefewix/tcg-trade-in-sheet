@@ -126,53 +126,22 @@ function scrapePageMeta() {
 }
 // ============================================================================
 
-// The panel sits under the 3M Snapshot block (2025-08 layout). Class names move
-// between TCGplayer deploys, so find the block by a *snapshot* class or its visible
-// "3M Snapshot" heading, then climb to the price-guide section's direct child so the
-// panel lands after the whole block, not inside it. Old points-header kept as fallback.
-function mountAnchor() {
-  const sect = document.querySelector(".product-details__price-guide");
-  let el = (sect || document).querySelector('[class*="snapshot" i]');
-  if (!el && sect) {
-    for (const h of sect.querySelectorAll("h2,h3,h4,span,div")) {
-      if (h.children.length === 0 && /3\s*M(onth)?\s*Snapshot/i.test(h.textContent)) {
-        el = h;
-        break;
-      }
-    }
-  }
-  if (el && sect && sect.contains(el)) {
-    while (el.parentElement !== sect) el = el.parentElement;
-    return el;
-  }
-  return el || document.querySelector(".price-guide__points-header");
-}
-
+// The panel lives in our own fixed-position root, under the Buylist pill. Nothing is
+// anchored to TCGplayer's markup any more, so their redesigns cannot move or break it.
 function mount(node) {
-  const anchor = mountAnchor();
-  if (anchor) { anchor.insertAdjacentElement("afterend", node); return; }
-  (document.querySelector(".product-details__price-guide") || document.body).appendChild(node);
+  floatRoot.appendChild(node);
 }
 
-// TCGplayer hydrates the price-guide section after first paint. On a fast load the
-// content script can mount into markup the framework then throws away, so the panel
-// silently vanishes. Rather than guess at timing, watch the DOM and re-mount.
-// Also catches client-side navigation between products, which never reloads the page.
+// TCGplayer is a SPA: navigation between products never reloads the page, and the
+// framework occasionally rebuilds <body> children wholesale. Watch the DOM to catch
+// both - a URL change rebuilds the panel, a detached root gets re-appended.
 let panel, floatRoot, href = "";
 function keepMounted() {
   let pending = 0;
   const check = () => {
     pending = 0;
     if (location.href !== href) { href = location.href; readUrl(); rebuild(); return; }
-    if (!panel) return;
-    if (!panel.isConnected) { mount(panel); }
-    // mounted on a fallback (body or the bare section), but the real anchor showed up
-    // late. "Properly mounted" has exactly one shape - immediately after the anchor -
-    // so anything else gets re-mounted the moment the anchor exists.
-    else {
-      const anchor = mountAnchor();
-      if (anchor && panel.previousElementSibling !== anchor) mount(panel);
-    }
+    if (panel && !panel.isConnected) mount(panel);
     if (floatRoot && !floatRoot.isConnected) document.body.appendChild(floatRoot);
   };
   new MutationObserver(() => { if (!pending) pending = setTimeout(check, 250); })
@@ -259,9 +228,10 @@ function style() {
     .tsc-panel :focus-visible,.tsc-root :focus-visible{
       outline:2px solid var(--tsc-ac);outline-offset:2px;border-radius:var(--tsc-r-ctl)}
 
-    /* ---- in-page panel ---- */
+    /* ---- floating panel: sits in the fixed root, under the Buylist pill ---- */
     .tsc-panel{border:1px solid var(--tsc-hair);border-radius:var(--tsc-r-box);
-      max-width:480px;padding:16px;margin:12px 0;color:var(--tsc-ink);
+      width:min(420px,calc(100vw - 36px));max-height:min(48vh,520px);overflow:auto;
+      padding:16px;margin:0;color:var(--tsc-ink);
       background-color:var(--tsc-bg);
       background-image:radial-gradient(color-mix(in srgb,var(--tsc-ac) 6%,transparent) 1px,transparent 1.4px);
       background-size:26px 26px;
