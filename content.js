@@ -126,9 +126,31 @@ function scrapePageMeta() {
 }
 // ============================================================================
 
+// The panel sits under the 3M Snapshot block (2025-08 layout). Class names move
+// between TCGplayer deploys, so find the block by a *snapshot* class or its visible
+// "3M Snapshot" heading, then climb to the price-guide section's direct child so the
+// panel lands after the whole block, not inside it. Old points-header kept as fallback.
+function mountAnchor() {
+  const sect = document.querySelector(".product-details__price-guide");
+  let el = (sect || document).querySelector('[class*="snapshot" i]');
+  if (!el && sect) {
+    for (const h of sect.querySelectorAll("h2,h3,h4,span,div")) {
+      if (h.children.length === 0 && /3\s*M(onth)?\s*Snapshot/i.test(h.textContent)) {
+        el = h;
+        break;
+      }
+    }
+  }
+  if (el && sect && sect.contains(el)) {
+    while (el.parentElement !== sect) el = el.parentElement;
+    return el;
+  }
+  return el || document.querySelector(".price-guide__points-header");
+}
+
 function mount(node) {
-  const header = document.querySelector(".price-guide__points-header");
-  if (header) { header.insertAdjacentElement("afterend", node); return; }
+  const anchor = mountAnchor();
+  if (anchor) { anchor.insertAdjacentElement("afterend", node); return; }
   (document.querySelector(".product-details__price-guide") || document.body).appendChild(node);
 }
 
@@ -145,11 +167,11 @@ function keepMounted() {
     if (!panel) return;
     if (!panel.isConnected) { mount(panel); }
     // mounted on a fallback (body or the bare section), but the real anchor showed up
-    // late. "Properly mounted" has exactly one shape - immediately after the header -
-    // so anything else gets re-mounted the moment the header exists.
+    // late. "Properly mounted" has exactly one shape - immediately after the anchor -
+    // so anything else gets re-mounted the moment the anchor exists.
     else {
-      const header = document.querySelector(".price-guide__points-header");
-      if (header && panel.previousElementSibling !== header) mount(panel);
+      const anchor = mountAnchor();
+      if (anchor && panel.previousElementSibling !== anchor) mount(panel);
     }
     if (floatRoot && !floatRoot.isConnected) document.body.appendChild(floatRoot);
   };
