@@ -261,7 +261,7 @@ function style() {
 
     /* ---- in-page panel ---- */
     .tsc-panel{border:1px solid var(--tsc-hair);border-radius:var(--tsc-r-box);
-      padding:16px;margin:12px 0;color:var(--tsc-ink);
+      max-width:480px;padding:16px;margin:12px 0;color:var(--tsc-ink);
       background-color:var(--tsc-bg);
       background-image:radial-gradient(color-mix(in srgb,var(--tsc-ac) 6%,transparent) 1px,transparent 1.4px);
       background-size:26px 26px;
