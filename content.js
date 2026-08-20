@@ -230,7 +230,7 @@ function style() {
 
     /* ---- floating panel: sits in the fixed root, under the Buylist pill ---- */
     .tsc-panel{border:1px solid var(--tsc-hair);border-radius:var(--tsc-r-box);
-      width:min(420px,calc(100vw - 36px));max-height:min(48vh,520px);overflow:auto;
+      width:min(420px,calc(100vw - 36px));max-height:min(48vh,520px);min-height:0;overflow:auto;
       padding:16px;margin:0;color:var(--tsc-ink);
       background-color:var(--tsc-bg);
       background-image:radial-gradient(color-mix(in srgb,var(--tsc-ac) 6%,transparent) 1px,transparent 1.4px);
@@ -292,10 +292,18 @@ function style() {
     /* ---- floating collection ---- */
     /* bottom clears TCGplayer's circular support-chat bubble (~64px + margins),
        which owns the bottom-right corner. The pill sits directly above it. */
-    .tsc-root{position:fixed;right:18px;bottom:96px;z-index:2147483000;
-      font:13px/1.5 var(--tsc-sans);color:var(--tsc-ink);
-      display:flex;flex-direction:column;align-items:flex-end;gap:10px}
-    .tsc-pill{display:inline-flex;align-items:center;gap:9px;padding:9px 13px 9px 11px;
+    /* top pins the column to the viewport so the stack (toast + drawer + pill + panel)
+       can never grow past the top edge, where fixed positioning would put it out of
+       reach - the page scrollbar does not move a fixed element. Anything that can
+       shrink does; the pill and toast hold their size. pointer-events are off on the
+       column itself, since it now spans the whole right edge and would otherwise eat
+       clicks meant for the page. */
+    .tsc-root{position:fixed;right:18px;bottom:96px;top:12px;z-index:2147483000;
+      font:13px/1.5 var(--tsc-sans);color:var(--tsc-ink);pointer-events:none;
+      display:flex;flex-direction:column;align-items:flex-end;justify-content:flex-end;
+      gap:10px}
+    .tsc-root>*{pointer-events:auto}
+    .tsc-pill{flex:none;display:inline-flex;align-items:center;gap:9px;padding:9px 13px 9px 11px;
       border-radius:var(--tsc-r-ctl);border:1px solid var(--tsc-hair);background:var(--tsc-bg);
       cursor:pointer;font:13px/1 var(--tsc-sans);font-weight:600;color:var(--tsc-ink);
       box-shadow:var(--tsc-shadow);
@@ -308,7 +316,7 @@ function style() {
     .tsc-badge[data-zero="1"]{background:#2c2d33;color:var(--tsc-mut)}
 
     /* undo toast: sits above the drawer, same surface language as everything else */
-    .tsc-toast{display:flex;align-items:center;gap:12px;padding:10px 11px 10px 14px;
+    .tsc-toast{flex:none;display:flex;align-items:center;gap:12px;padding:10px 11px 10px 14px;
       max-width:min(436px,calc(100vw - 36px));
       background:var(--tsc-bg);border:1px solid var(--tsc-hair);border-radius:var(--tsc-r-ctl);
       box-shadow:var(--tsc-shadow);font-size:12px;color:var(--tsc-ink-2);
@@ -326,8 +334,10 @@ function style() {
     .tsc-undo:active{transform:translateY(1px)}
     @keyframes tsc-rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 
+    /* min-height:0 lets the drawer shrink below its content inside .tsc-root; without
+       it a flex column refuses to shrink and the overflow goes off the top. */
     .tsc-drawer{width:min(560px,calc(100vw - 36px));
-      max-height:min(calc(100vh - 120px),720px);
+      max-height:720px;min-height:0;
       display:none;flex-direction:column;background:var(--tsc-bg);
       border:1px solid var(--tsc-hair);border-radius:var(--tsc-r-box);
       box-shadow:0 16px 42px rgba(0,0,0,.5);overflow:hidden}
